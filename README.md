@@ -383,7 +383,7 @@ All commands are typed at the `> ` prompt (or piped via stdin). Every response i
 | `wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>` | Execute the approved, unchanged plan once |
 | `wallet <key> pay-status <intent_id>` | Reconcile quote and proof states without retrying the melt |
 | `wallet <key> sync` | Sync pending proofs with the mint |
-| `wallet <key> restore-audit` | Check every restored proof against NUT-07 without changing wallet state |
+| `restore-audit <mint_url>` | Check every proof for one allowlisted mint in a restored DB against NUT-07 without changing wallet state or exposing the access key |
 | `decode <data>` | Decode a Cashu token, Cashu request, or BOLT11 invoice |
 | `help` | Show available commands |
 | `exit` | Quit |

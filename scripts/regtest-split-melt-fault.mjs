@@ -475,7 +475,7 @@ async function main() {
         )
 
         const sourceAudit = await runCliSuccess(
-            `wallet ${sourceAccessKey} restore-audit`,
+            `restore-audit ${sourceMint.origin}`,
             { ...context, label: 'source_full_proof_audit' },
         )
         requireCondition(sourceAudit.funded_restore_ready === true, 'source_proof_audit_not_ready')
@@ -492,7 +492,7 @@ async function main() {
         await copyFile(databasePath, restoredDatabasePath)
         await chmod(restoredDatabasePath, 0o600)
         const restoredAudit = await runCliSuccess(
-            `wallet ${sourceAccessKey} restore-audit`,
+            `restore-audit ${sourceMint.origin}`,
             {
                 ...context,
                 databasePath: restoredDatabasePath,

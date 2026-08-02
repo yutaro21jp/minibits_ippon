@@ -54,6 +54,7 @@ async function handleCommand(parts: string[]): Promise<void> {
         out({
             commands: [
                 'info',
+                'restore-audit <mint_url>',
                 'wallet create [name] [mint_url]',
                 'wallet list',
                 'wallet <key> balance',
@@ -65,7 +66,6 @@ async function handleCommand(parts: string[]): Promise<void> {
                 'wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>',
                 'wallet <key> pay-status <intent_id>',
                 'wallet <key> sync',
-                'wallet <key> restore-audit',
                 'decode <cashu_token_or_bolt11_or_cashu_request>',
                 'help',
                 'exit',
@@ -121,6 +121,39 @@ async function handleCommand(parts: string[]): Promise<void> {
         } catch (e: any) {
             cliError(e.message, 'DECODE_ERROR')
         }
+        return
+    }
+
+    // Recovery-only command: private filesystem access to the restored SQLite
+    // database is the authority. The public, allowlisted mint URL selects one
+    // restored wallet without copying its access-key secret to the recovery
+    // device. No access key or proof material is emitted.
+    if (cmd === 'restore-audit') {
+        try {
+            if (parts.length !== 2) {
+                cliError('Restore audit requires one allowlisted mint URL', 'RESTORE_AUDIT_ERROR')
+                return
+            }
+            const mintUrl = parts[1]
+            if (!WalletService.getMintUrls().includes(mintUrl)) {
+                cliError('Restored wallet mint is not allowlisted', 'RESTORE_AUDIT_ERROR')
+                return
+            }
+            const wallets = await prisma.wallet.findMany({
+                where: { mint: mintUrl },
+                orderBy: { id: 'asc' },
+            })
+            if (wallets.length !== 1) {
+                cliError(
+                    'Restore audit requires exactly one wallet for the mint',
+                    'RESTORE_AUDIT_ERROR',
+                )
+                return
+            }
+            const wallet = wallets[0]
+            const result = await WalletService.auditRestoredProofs(wallet.id, wallet.mint)
+            out(result as unknown as Record<string, unknown>)
+        } catch (e: any) { cliError(e.message, 'RESTORE_AUDIT_ERROR') }
         return
     }
 
@@ -360,16 +393,6 @@ async function handleCommand(parts: string[]): Promise<void> {
                 const result = await WalletService.syncProofsStateWithMint(wallet.id, wallet.mint)
                 out(result as unknown as Record<string, unknown>)
             } catch (e: any) { cliError(e.message) }
-            return
-        }
-
-        // restore-audit checks every stored proof against NUT-07 without
-        // spending, exporting, deleting, or changing any proof state.
-        if (op === 'restore-audit') {
-            try {
-                const result = await WalletService.auditRestoredProofs(wallet.id, wallet.mint)
-                out(result as unknown as Record<string, unknown>)
-            } catch (e: any) { cliError(e.message, 'RESTORE_AUDIT_ERROR') }
             return
         }
 
