@@ -44,7 +44,13 @@ directly; a product embeds it as its wallet engine and supplies the approval UI.
   response is lost, immediate UNKNOWN persistence, and status-only recovery
   after process restart. It also verifies that cashu-ts cannot silently retry
   the approved melt through NUT-19 transport caching.
-- Funded restore reconciliation and an independent security review are still
+- `restore-audit` checks every proof in a restored private database against the
+  mint's NUT-07 state without spending or exporting it. It fails readiness on
+  PENDING proofs, local/remote mismatches, active reservations, or unresolved
+  melt operations. Because querying historical spent proofs can help the mint
+  correlate activity, products must require an explicit recovery-time privacy
+  acknowledgement before invoking it.
+- A real funded restore drill and an independent security review are still
   required before a production release.
 
 ### Opt-in local regtest fault drill
@@ -377,6 +383,7 @@ All commands are typed at the `> ` prompt (or piped via stdin). Every response i
 | `wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>` | Execute the approved, unchanged plan once |
 | `wallet <key> pay-status <intent_id>` | Reconcile quote and proof states without retrying the melt |
 | `wallet <key> sync` | Sync pending proofs with the mint |
+| `wallet <key> restore-audit` | Check every restored proof against NUT-07 without changing wallet state |
 | `decode <data>` | Decode a Cashu token, Cashu request, or BOLT11 invoice |
 | `help` | Show available commands |
 | `exit` | Quit |

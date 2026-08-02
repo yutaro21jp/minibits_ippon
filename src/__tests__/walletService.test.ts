@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
     prismaProofFindMany: vi.fn(),
     prismaProofCreate: vi.fn(),
     prismaProofUpdateMany: vi.fn(),
+    prismaMeltOperationCount: vi.fn(),
 }))
 
 // ── mocks ─────────────────────────────────────────────────────────────────────
@@ -57,6 +58,7 @@ vi.mock('../utils/prismaClient', () => ({
             updateMany: mocks.prismaProofUpdateMany,
         },
         wallet: { create: vi.fn(), findUnique: vi.fn() },
+        meltOperation: { count: mocks.prismaMeltOperationCount },
     },
 }))
 
@@ -72,7 +74,8 @@ const makeProof = (secret: string, amount = 100) => ({
 
 const makeDbProof = (secret: string, amount = 100) => ({
     id: 1, walletId: 1, proofId: `id-${secret}`, amount, secret,
-    C: `C-${secret}`, dleq: null, witness: null, status: ProofStatus.UNSPENT,
+    C: `C-${secret}`, dleq: null, witness: null, p2pkE: null,
+    status: ProofStatus.UNSPENT, reservedByIntentId: null,
     createdAt: new Date(),
 })
 
@@ -197,6 +200,96 @@ describe('WalletService.syncProofsStateWithMint', () => {
 
         const result = await WalletService.syncProofsStateWithMint(1, 'https://testmint.example.com')
         expect(result).toEqual({ spent: 1, unspent: 1, pending: 1 })
+    })
+})
+
+describe('WalletService.auditRestoredProofs', () => {
+    beforeEach(() => {
+        vi.clearAllMocks()
+        mocks.walletLoadMint.mockResolvedValue(undefined)
+        mocks.prismaMeltOperationCount.mockResolvedValue(0)
+    })
+
+    it('checks every restored proof and reports a funded wallet ready without changing state', async () => {
+        mocks.prismaProofFindMany.mockResolvedValue([
+            makeDbProof('unspent', 21),
+            { ...makeDbProof('spent', 13), id: 2, status: ProofStatus.SPENT },
+        ])
+        mocks.walletCheckProofsStates.mockResolvedValue([
+            { state: CheckStateEnum.UNSPENT },
+            { state: CheckStateEnum.SPENT },
+        ])
+
+        const result = await WalletService.auditRestoredProofs(
+            1,
+            'https://restore-audit-ready.example.com',
+        )
+
+        expect(result).toEqual({
+            audit_version: 1,
+            all_proofs_checked: true,
+            proofs_total: 2,
+            local_unspent: 1,
+            local_pending: 0,
+            local_spent: 1,
+            remote_unspent: 1,
+            remote_pending: 0,
+            remote_spent: 1,
+            recoverable_balance: 21,
+            state_mismatches: 0,
+            reserved_proofs: 0,
+            unresolved_operations: 0,
+            funded_restore_ready: true,
+        })
+        expect(mocks.prismaProofUpdateMany).not.toHaveBeenCalled()
+    })
+
+    it('fails funded readiness on a mismatch, pending proof, reservation, or unresolved melt', async () => {
+        mocks.prismaProofFindMany.mockResolvedValue([
+            makeDbProof('mismatch', 21),
+            {
+                ...makeDbProof('pending', 13),
+                id: 2,
+                status: ProofStatus.PENDING,
+                reservedByIntentId: 'wallet_0123456789abcdef01234567',
+            },
+        ])
+        mocks.walletCheckProofsStates.mockResolvedValue([
+            { state: CheckStateEnum.SPENT },
+            { state: CheckStateEnum.PENDING },
+        ])
+        mocks.prismaMeltOperationCount.mockResolvedValue(1)
+
+        const result = await WalletService.auditRestoredProofs(
+            1,
+            'https://restore-audit-blocked.example.com',
+        )
+
+        expect(result).toMatchObject({
+            proofs_total: 2,
+            remote_pending: 1,
+            recoverable_balance: 0,
+            state_mismatches: 1,
+            reserved_proofs: 1,
+            unresolved_operations: 1,
+            funded_restore_ready: false,
+        })
+        expect(mocks.prismaProofUpdateMany).not.toHaveBeenCalled()
+    })
+
+    it('rejects an incomplete mint response instead of treating unchecked proofs as restored', async () => {
+        mocks.prismaProofFindMany.mockResolvedValue([
+            makeDbProof('first', 21),
+            { ...makeDbProof('second', 13), id: 2 },
+        ])
+        mocks.walletCheckProofsStates.mockResolvedValue([
+            { state: CheckStateEnum.UNSPENT },
+        ])
+
+        await expect(WalletService.auditRestoredProofs(
+            1,
+            'https://restore-audit-incomplete.example.com',
+        )).rejects.toMatchObject({ name: 'CONNECTION_ERROR' })
     })
 })
 

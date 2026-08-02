@@ -2,7 +2,7 @@
 
 import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, chmod, copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -474,6 +474,36 @@ async function main() {
             'database_integrity_check_failed',
         )
 
+        const sourceAudit = await runCliSuccess(
+            `wallet ${sourceAccessKey} restore-audit`,
+            { ...context, label: 'source_full_proof_audit' },
+        )
+        requireCondition(sourceAudit.funded_restore_ready === true, 'source_proof_audit_not_ready')
+        requireCondition(sourceAudit.all_proofs_checked === true, 'source_proof_audit_incomplete')
+        requireCondition(sourceAudit.remote_pending === 0, 'source_proof_audit_pending')
+        requireCondition(sourceAudit.state_mismatches === 0, 'source_proof_audit_mismatch')
+        requireCondition(sourceAudit.reserved_proofs === 0, 'source_proof_audit_reserved')
+        requireCondition(sourceAudit.unresolved_operations === 0, 'source_proof_audit_unresolved')
+        requireCondition(sourceAudit.recoverable_balance > 0, 'source_proof_audit_unfunded')
+
+        await prisma.$disconnect()
+        prisma = undefined
+        const restoredDatabasePath = path.join(temporaryDirectory, 'ippon-restored.sqlite')
+        await copyFile(databasePath, restoredDatabasePath)
+        await chmod(restoredDatabasePath, 0o600)
+        const restoredAudit = await runCliSuccess(
+            `wallet ${sourceAccessKey} restore-audit`,
+            {
+                ...context,
+                databasePath: restoredDatabasePath,
+                label: 'restored_full_proof_audit',
+            },
+        )
+        requireCondition(
+            JSON.stringify(restoredAudit) === JSON.stringify(sourceAudit),
+            'restored_proof_audit_changed',
+        )
+
         faultState = await readFaultState(faultStatePath)
         requireCondition(faultState.melt_posts === 1, 'melt_was_retried_after_restart')
         summary = {
@@ -500,6 +530,16 @@ async function main() {
                 sqlite_integrity: 'ok',
             },
             approval_tamper_rejected_before_melt: true,
+            restored_proof_audit: {
+                all_proofs_checked: restoredAudit.all_proofs_checked,
+                proofs_total: restoredAudit.proofs_total,
+                recoverable_balance: restoredAudit.recoverable_balance,
+                remote_unspent: restoredAudit.remote_unspent,
+                remote_pending: restoredAudit.remote_pending,
+                remote_spent: restoredAudit.remote_spent,
+                state_mismatches: restoredAudit.state_mismatches,
+                funded_restore_ready: restoredAudit.funded_restore_ready,
+            },
             secrets_emitted: false,
         }
     } finally {

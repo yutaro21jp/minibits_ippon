@@ -16,12 +16,13 @@ import {
     setGlobalRequestOptions,
     sumProofs,
 } from '@cashu/cashu-ts'
-import { ProofStatus } from '@prisma/client'
+import { MeltOperationState, ProofStatus } from '@prisma/client'
 import prisma from '../utils/prismaClient'
 import AppError, { Err } from '../utils/AppError'
 import { log } from './logService'
 
 const _wallets = new Map<string, Wallet>()
+const MAX_RESTORE_AUDIT_PROOFS = 10_000
 
 // cashu-ts enables implicit NUT-19 retries for endpoints advertised as cached.
 // That is useful for ordinary clients, but an approval-gated melt must have one
@@ -128,6 +129,132 @@ const loadProofs = async function (walletId: number, status?: ProofStatus): Prom
             : undefined,
         p2pk_e: p.p2pkE ?? undefined,
     }))
+}
+
+
+type RestoreAudit = {
+    audit_version: number
+    all_proofs_checked: boolean
+    proofs_total: number
+    local_unspent: number
+    local_pending: number
+    local_spent: number
+    remote_unspent: number
+    remote_pending: number
+    remote_spent: number
+    recoverable_balance: number
+    state_mismatches: number
+    reserved_proofs: number
+    unresolved_operations: number
+    funded_restore_ready: boolean
+}
+
+
+const auditRestoredProofs = async function (walletId: number, mintUrl: string): Promise<RestoreAudit> {
+    const stored = await prisma.proof.findMany({
+        where: { walletId },
+        orderBy: { id: 'asc' },
+    })
+    if (stored.length > MAX_RESTORE_AUDIT_PROOFS) {
+        throw new AppError(
+            400,
+            Err.VALIDATION_ERROR,
+            'Restored wallet exceeds the reviewed proof-audit limit',
+            { caller: 'auditRestoredProofs' },
+        )
+    }
+
+    const proofs = stored.map(p => ({
+        id: p.proofId,
+        amount: Amount.from(p.amount),
+        secret: p.secret,
+        C: p.C,
+        dleq: p.dleq ? JSON.parse(p.dleq) : undefined,
+        witness: p.witness
+            ? (p.witness.startsWith('{') || p.witness.startsWith('[')
+                ? JSON.parse(p.witness)
+                : p.witness)
+            : undefined,
+        p2pk_e: p.p2pkE ?? undefined,
+    }))
+    const wallet = await getWallet(mintUrl)
+    const remoteStates = proofs.length > 0 ? await wallet.checkProofsStates(proofs) : []
+    if (remoteStates.length !== stored.length) {
+        throw new AppError(
+            500,
+            Err.CONNECTION_ERROR,
+            'Mint returned an incomplete restored proof audit',
+            { caller: 'auditRestoredProofs' },
+        )
+    }
+
+    const localCounts = { UNSPENT: 0, PENDING: 0, SPENT: 0 }
+    const remoteCounts = { UNSPENT: 0, PENDING: 0, SPENT: 0 }
+    let recoverableBalance = Amount.zero()
+    let stateMismatches = 0
+    for (let index = 0; index < stored.length; index += 1) {
+        const localState = stored[index].status
+        const remoteState = remoteStates[index]?.state
+        if (
+            !Object.hasOwn(localCounts, localState)
+            || typeof remoteState !== 'string'
+            || !Object.hasOwn(remoteCounts, remoteState)
+        ) {
+            throw new AppError(
+                500,
+                Err.CONNECTION_ERROR,
+                'Restored proof audit returned an unknown state',
+                { caller: 'auditRestoredProofs' },
+            )
+        }
+        const checkedRemoteState = remoteState as keyof typeof remoteCounts
+        localCounts[localState] += 1
+        remoteCounts[checkedRemoteState] += 1
+        if (localState !== checkedRemoteState) stateMismatches += 1
+        if (checkedRemoteState === CheckStateEnum.UNSPENT) {
+            recoverableBalance = recoverableBalance.add(proofs[index].amount)
+        }
+    }
+
+    const reservedProofs = stored.filter(proof => proof.reservedByIntentId !== null).length
+    const unresolvedOperations = await prisma.meltOperation.count({
+        where: {
+            walletId,
+            state: {
+                in: [
+                    MeltOperationState.PREPARED,
+                    MeltOperationState.EXECUTING,
+                    MeltOperationState.PENDING,
+                    MeltOperationState.UNKNOWN,
+                ],
+            },
+        },
+    })
+    const allProofsChecked = remoteStates.length === stored.length
+    const fundedRestoreReady = allProofsChecked
+        && stored.length > 0
+        && recoverableBalance.greaterThan(Amount.zero())
+        && remoteCounts.PENDING === 0
+        && stateMismatches === 0
+        && reservedProofs === 0
+        && unresolvedOperations === 0
+
+    return {
+        audit_version: 1,
+        all_proofs_checked: allProofsChecked,
+        proofs_total: stored.length,
+        local_unspent: localCounts.UNSPENT,
+        local_pending: localCounts.PENDING,
+        local_spent: localCounts.SPENT,
+        remote_unspent: remoteCounts.UNSPENT,
+        remote_pending: remoteCounts.PENDING,
+        remote_spent: remoteCounts.SPENT,
+        recoverable_balance: recoverableBalance.toNumber(),
+        state_mismatches: stateMismatches,
+        reserved_proofs: reservedProofs,
+        unresolved_operations: unresolvedOperations,
+        funded_restore_ready: fundedRestoreReady,
+    }
 }
 
 
@@ -454,5 +581,6 @@ export const WalletService = {
     checkMeltQuote,
     meltProofs,
     syncProofsStateWithMint,
+    auditRestoredProofs,
     checkTokenState,
 }
