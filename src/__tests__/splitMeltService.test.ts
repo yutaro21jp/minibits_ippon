@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { Amount, CheckStateEnum, MeltQuoteState } from '@cashu/cashu-ts'
+import { Amount, CheckStateEnum, MeltQuoteState, OutputData } from '@cashu/cashu-ts'
 import { MeltOperationState, ProofStatus } from '@prisma/client'
 
 const PAYMENT_HASH = '02d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc'
@@ -148,7 +148,7 @@ describe('SplitMeltService', () => {
         mocks.prepareMelt.mockResolvedValue({
             method: 'bolt11',
             inputs: [selectedProof],
-            outputData: [],
+            outputData: [OutputData.createSingleRandomData(1, 'keyset-1')],
             keysetId: 'keyset-1',
             quote: quote(),
         })
@@ -276,6 +276,8 @@ describe('SplitMeltService', () => {
             fee_reserve: 5,
             input_fee: 2,
             max_spend: 107,
+            proof_input_total: 107,
+            minimum_change: 0,
             payment_hash: PAYMENT_HASH,
         })
         expect(proofStatus).toBe(ProofStatus.PENDING)
@@ -292,14 +294,69 @@ describe('SplitMeltService', () => {
         expect(mocks.completeMelt).not.toHaveBeenCalled()
     })
 
-    it('rejects a proof selection that would need an unapproved swap', async () => {
+    it('prepares a proof selection with deterministic minimum change without swapping', async () => {
         mocks.selectProofsToSend.mockReturnValue({
             keep: [],
             send: [{ ...selectedProof, amount: Amount.from(108) }],
         })
+        mocks.prepareMelt.mockResolvedValueOnce({
+            method: 'bolt11',
+            inputs: [{ ...selectedProof, amount: Amount.from(108) }],
+            outputData: [OutputData.createSingleRandomData(1, 'keyset-1')],
+            keysetId: 'keyset-1',
+            quote: quote(),
+        })
+
+        const result = await SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE)
+
+        expect(result).toMatchObject({
+            max_spend: 107,
+            proof_input_total: 108,
+            minimum_change: 1,
+        })
+        expect(mocks.prepareMelt).toHaveBeenCalledTimes(1)
+        expect(operation).not.toBeNull()
+    })
+
+    it('rejects a selected proof set that cannot cover the maximum spend', async () => {
+        mocks.selectProofsToSend.mockReturnValue({
+            keep: [],
+            send: [{ ...selectedProof, amount: Amount.from(106) }],
+        })
 
         await expect(SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE))
-            .rejects.toMatchObject({ code: 'EXACT_PROOFS_REQUIRED' })
+            .rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' })
+        expect(mocks.prepareMelt).not.toHaveBeenCalled()
+        expect(mocks.proofUpdateMany).not.toHaveBeenCalled()
+        expect(operation).toBeNull()
+    })
+
+    it('rejects a preview that changes the selected proof inputs', async () => {
+        mocks.prepareMelt.mockResolvedValueOnce({
+            method: 'bolt11',
+            inputs: [{ ...selectedProof, secret: 'different-secret' }],
+            outputData: [OutputData.createSingleRandomData(1, 'keyset-1')],
+            keysetId: 'keyset-1',
+            quote: quote(),
+        })
+
+        await expect(SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE))
+            .rejects.toMatchObject({ code: 'INVALID_PROOF_PLAN' })
+        expect(mocks.proofUpdateMany).not.toHaveBeenCalled()
+        expect(operation).toBeNull()
+    })
+
+    it('rejects a change-bearing preview without recovery outputs', async () => {
+        mocks.prepareMelt.mockResolvedValueOnce({
+            method: 'bolt11',
+            inputs: [selectedProof],
+            outputData: [],
+            keysetId: 'keyset-1',
+            quote: quote(),
+        })
+
+        await expect(SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE))
+            .rejects.toMatchObject({ code: 'INVALID_PROOF_PLAN' })
         expect(mocks.proofUpdateMany).not.toHaveBeenCalled()
         expect(operation).toBeNull()
     })

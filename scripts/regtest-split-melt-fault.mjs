@@ -9,8 +9,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ACKNOWLEDGEMENT = 'local-regtest-fake-ecash-only'
-const FUNDING_FAKE_SATS = 255
-const PAYMENT_FAKE_SATS = 16
+const FUNDING_FAKE_SATS = 25
+const PAYMENT_FAKE_SATS = 1
 const PROCESS_TIMEOUT_MS = 45_000
 const MAX_STATUS_ATTEMPTS = 15
 
@@ -319,8 +319,8 @@ async function main() {
         process.env.IPPON_REGTEST_FAULT_ACK === ACKNOWLEDGEMENT,
         'explicit_local_regtest_ack_required',
     )
-    requireCondition(FUNDING_FAKE_SATS <= 255, 'fake_funding_limit_exceeded')
-    requireCondition(PAYMENT_FAKE_SATS <= 16, 'fake_payment_limit_exceeded')
+    requireCondition(FUNDING_FAKE_SATS <= 25, 'fake_funding_limit_exceeded')
+    requireCondition(PAYMENT_FAKE_SATS <= 1, 'fake_payment_limit_exceeded')
     await access(appPath)
     await access(hookPath)
     await access(pythonHookPath)
@@ -385,6 +385,16 @@ async function main() {
         requireCondition(prepared.state === 'PREPARED', 'payment_not_prepared')
         requireCondition(prepared.amount === PAYMENT_FAKE_SATS, 'prepared_amount_mismatch')
         requireCondition(Number.isSafeInteger(prepared.max_spend), 'prepared_max_spend_invalid')
+        requireCondition(
+            Number.isSafeInteger(prepared.proof_input_total)
+            && prepared.proof_input_total > prepared.max_spend,
+            'prepared_change_bearing_proof_input_missing',
+        )
+        requireCondition(
+            prepared.minimum_change === prepared.proof_input_total - prepared.max_spend
+            && prepared.minimum_change > 0,
+            'prepared_minimum_change_mismatch',
+        )
         for (const field of ['invoice_sha256', 'quote_sha256', 'proof_plan_sha256', 'payment_hash']) {
             requireCondition(/^[0-9a-f]{64}$/.test(prepared[field]), `prepared_${field}_invalid`)
         }
@@ -530,6 +540,11 @@ async function main() {
                 sqlite_integrity: 'ok',
             },
             approval_tamper_rejected_before_melt: true,
+            change_bearing_proof_plan: {
+                maximum_spend: prepared.max_spend,
+                proof_input_total: prepared.proof_input_total,
+                minimum_change: prepared.minimum_change,
+            },
             restored_proof_audit: {
                 all_proofs_checked: restoredAudit.all_proofs_checked,
                 proofs_total: restoredAudit.proofs_total,

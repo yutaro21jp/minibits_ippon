@@ -16,8 +16,9 @@ send ecash and pay Lightning invoices. This fork adds a safer local-CLI payment
 boundary for systems that must not pay immediately when an invoice arrives:
 
 1. `pay-prepare` obtains the Cashu melt quote, selects and reserves proofs, and
-   returns the amount, fee ceiling, expiry, payment hash, and approval hashes.
-   It does not pay.
+   returns the amount, fee ceiling, maximum spend, temporarily submitted proof
+   total, minimum change, expiry, payment hash, and approval hashes. It does not
+   pay.
 2. An external application can show those values to a person or apply its own
    approval policy without receiving the raw quote ID or proofs.
 3. `pay-execute` accepts only the unchanged approval hashes and attempts the
@@ -37,7 +38,9 @@ directly; a product embeds it as its wallet engine and supplies the approval UI.
 - cashu-ts is pinned to 4.7.2 and amounts stay native until database, REST, or
   CLI integer boundaries.
 - Quote IDs, proofs, and change-recovery material stay in the private Ippon
-  database. Approval responses expose only hashes and bounded amounts.
+  database. Approval responses expose only hashes and bounded amounts. The
+  maximum economic spend is kept separate from the proof total temporarily
+  handed to the mint; any excess is covered by persisted NUT-08 change outputs.
 - The full mocked test suite and build pass, including restart, proof
   reservation, preimage verification, and ambiguous-outcome tests.
 - A two-mint local Nutshell FakeWallet drill now covers an accepted melt whose
@@ -67,13 +70,15 @@ IPPON_NUTSHELL_PATH=/absolute/path/to/nutshell \
 npm run test:regtest-fault
 ```
 
-The exact acknowledgement, two loopback-only origins, 255-fake-sat funding cap,
-16-fake-sat payment cap, disposable databases, and secret-free result are
+The exact acknowledgement, two loopback-only origins, 25-fake-sat funding cap,
+1-fake-sat payment cap, disposable databases, and secret-free result are
 enforced in the harness. It forwards one accepted melt, discards that response,
 blocks the first reconciliation, restarts Ippon, and permits only `pay-status`
-to recover the operation. The temporary wallets, proofs, mint keys, and
-databases are removed even on failure; `uv` may retain only its public package
-and Python download cache.
+to recover the operation. The 25-fake-sat source deliberately lacks an exact
+small-denomination proof set, so the drill also verifies persisted change
+recovery. The temporary wallets, proofs, mint keys, and databases are removed
+even on failure; `uv` may retain only its public package and Python download
+cache.
 
 Nutshell's FakeWallet is adjusted only inside these acknowledged local test
 processes so its synthetic invoice uses standard 32-byte BOLT11 preimage
@@ -379,7 +384,7 @@ All commands are typed at the `> ` prompt (or piped via stdin). Every response i
 | `wallet <key> deposit-check <quote_id>` | Check deposit status; auto-mints ecash when paid |
 | `wallet <key> send <amount> [lock_pubkey]` | Export a Cashu token (optionally P2PK-locked) |
 | `wallet <key> receive <token>` | Import a Cashu token |
-| `wallet <key> pay-prepare <intent_id> <bolt11>` | Create and persist a quote and exact proof plan without paying |
+| `wallet <key> pay-prepare <intent_id> <bolt11>` | Create and persist a quote, fixed proof plan, and change recovery data without paying |
 | `wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>` | Execute the approved, unchanged plan once |
 | `wallet <key> pay-status <intent_id>` | Reconcile quote and proof states without retrying the melt |
 | `wallet <key> sync` | Sync pending proofs with the mint |

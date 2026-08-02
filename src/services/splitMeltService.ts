@@ -50,6 +50,8 @@ type PreparedPayment = ReconciliationEvidence & {
     fee_reserve: number
     input_fee: number
     max_spend: number
+    proof_input_total: number
+    minimum_change: number
     expiry: number
     payment_hash: string
     invoice_sha256: string
@@ -518,13 +520,33 @@ async function prepare(
     const inputFeeAmount = wallet.getFeesForProofs(selected)
     const maxSpendAmount = baseAmount.add(inputFeeAmount)
     const selectedTotal = sumProofs(selected)
-    if (!selectedTotal.equals(maxSpendAmount)) {
-        fail('EXACT_PROOFS_REQUIRED', 'Payment preparation would require an unapproved proof swap')
+    if (selectedTotal.lessThan(maxSpendAmount)) {
+        fail('INSUFFICIENT_BALANCE', 'The selected proof set does not cover the maximum spend')
     }
     const inputFee = boundaryNumber(inputFeeAmount, 'input fee')
     const maxSpend = boundaryNumber(maxSpendAmount, 'maximum spend')
+    const proofInputTotal = boundaryNumber(selectedTotal, 'proof input total')
+    const minimumChange = boundaryNumber(
+        selectedTotal.subtract(maxSpendAmount),
+        'minimum change',
+    )
 
     const preview = await wallet.prepareMelt('bolt11', quote, selected)
+    const selectedSecrets = new Set(selected.map(proof => proof.secret))
+    if (
+        preview.inputs.length !== selected.length
+        || preview.inputs.some(proof => !selectedSecrets.has(proof.secret))
+        || !sumProofs(preview.inputs).equals(selectedTotal)
+        || !wallet.getFeesForProofs(preview.inputs).equals(inputFeeAmount)
+    ) {
+        fail('INVALID_PROOF_PLAN', 'The prepared melt inputs changed during preview')
+    }
+    if (
+        selectedTotal.greaterThan(quote.amount.add(inputFeeAmount))
+        && preview.outputData.length === 0
+    ) {
+        fail('INVALID_PROOF_PLAN', 'The prepared melt omitted required change recovery outputs')
+    }
     const selectedProofsJson = JSON.stringify(serializeProofs(preview.inputs))
     const changeOutputsJson = JSON.stringify(preview.outputData.map(item => OutputData.serialize(item)))
     const secrets = preview.inputs.map(proof => proof.secret)
@@ -574,6 +596,8 @@ async function prepare(
         fee_reserve: feeReserve,
         input_fee: inputFee,
         max_spend: maxSpend,
+        proof_input_total: proofInputTotal,
+        minimum_change: minimumChange,
         expiry: quote.expiry,
         payment_hash: paymentHash(invoice),
         invoice_sha256: hashes.invoiceSha256,

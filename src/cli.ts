@@ -85,7 +85,7 @@ async function handleCommand(parts: string[]): Promise<void> {
                 max_pay:     parseInt(process.env.MAX_PAY     || '50000'),
             },
             payment_adapter: {
-                protocol_version: 2,
+                protocol_version: 3,
                 cashu_ts_version: '4.7.2',
                 split_melt: true,
                 persistent_operations: true,
