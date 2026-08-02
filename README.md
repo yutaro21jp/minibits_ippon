@@ -2,6 +2,50 @@
 
 Ippon (一本, "one point", "decisive victory")
 
+> [!IMPORTANT]
+> This owner fork is an experimental, approval-gated payment branch based on
+> [Minibits Ippon](https://github.com/minibits-cash/minibits_ippon). It is meant
+> for developers building agents, bots, and services that need a human or policy
+> check before a Lightning payment. It is not a consumer wallet or a
+> production-ready release. Use disposable wallets and small test amounts only.
+
+## Why this fork exists
+
+The upstream project gives software a small Cashu wallet that can receive and
+send ecash and pay Lightning invoices. This fork adds a safer local-CLI payment
+boundary for systems that must not pay immediately when an invoice arrives:
+
+1. `pay-prepare` obtains the Cashu melt quote, selects and reserves proofs, and
+   returns the amount, fee ceiling, expiry, payment hash, and approval hashes.
+   It does not pay.
+2. An external application can show those values to a person or apply its own
+   approval policy without receiving the raw quote ID or proofs.
+3. `pay-execute` accepts only the unchanged approval hashes and attempts the
+   payment once.
+4. `pay-status` reconciles PENDING or UNKNOWN outcomes after a timeout or
+   restart. It never retries the melt.
+
+This is useful for an AI assistant proposing a small purchase, an expense bot
+waiting for an owner, or any service that wants to avoid blind retries and
+duplicate payments. End users normally do not operate this repository
+directly; a product embeds it as its wallet engine and supplies the approval UI.
+
+### Current safety boundary
+
+- The split payment flow is implemented only for local CLI mode. The REST API
+  remains outside this approval adapter.
+- cashu-ts is pinned to 4.7.2 and amounts stay native until database, REST, or
+  CLI integer boundaries.
+- Quote IDs, proofs, and change-recovery material stay in the private Ippon
+  database. Approval responses expose only hashes and bounded amounts.
+- The full mocked test suite and build pass, including restart, proof
+  reservation, preimage verification, and ambiguous-outcome tests.
+- Funded restore reconciliation, testnet/regtest fault injection, and an
+  independent security review are still required before a production release.
+
+The original project and this fork are distributed under the MIT License. See
+[`LICENSE`](LICENSE). The upstream authorship and Git history are preserved.
+
 Minibits Ippon is a minimalistic ecash and Lightning wallet implementing the Cashu protocol. It can be operated as a **REST API server** (for hosted deployments and AI agents connecting over HTTP) or as a **local CLI** (for AI agents that install and control it directly via standard I/O).
 
 > ### Try it out
