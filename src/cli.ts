@@ -409,14 +409,16 @@ async function handleCommand(parts: string[]): Promise<void> {
 // in-flight command has finished — safe for both interactive and piped use.
 export function startCli(): Promise<void> {
     return new Promise<void>((resolve) => {
+        const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY)
         const rl = readline.createInterface({
             input:  process.stdin,
-            output: process.stdout,
+            output: interactive ? process.stdout : undefined,
+            terminal: interactive,
             prompt: '> ',
         })
 
         process.stderr.write('Minibits Ippon CLI — type "help" for commands, "exit" to quit\n')
-        rl.prompt()
+        if (interactive) rl.prompt()
 
         // Track the in-flight async handler so the 'close' handler can await it.
         let currentOp: Promise<void> | null = null
@@ -424,7 +426,10 @@ export function startCli(): Promise<void> {
 
         rl.on('line', (line: string) => {
             const trimmed = line.trim()
-            if (!trimmed) { rl.prompt(); return }
+            if (!trimmed) {
+                if (interactive) rl.prompt()
+                return
+            }
 
             if (trimmed === 'exit' || trimmed === 'quit') {
                 process.stderr.write('Bye!\n')
@@ -440,7 +445,7 @@ export function startCli(): Promise<void> {
                 } catch (e: any) {
                     cliError(e.message)
                 }
-                if (!closing) rl.prompt()
+                if (!closing && interactive) rl.prompt()
             })()
         })
 
