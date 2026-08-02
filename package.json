@@ -8,6 +8,7 @@
     "build": "tsc --project tsconfig.json --noEmit && esbuild src/index.ts --bundle --platform=node --target=es2022 --format=esm --outdir=dist --packages=external --sourcemap",
     "start:prod": "node dist/index.js",
     "test": "vitest run",
+    "test:regtest-fault": "npm run build && node scripts/regtest-split-melt-fault.mjs",
     "test:watch": "vitest",
     "db:setup": "node scripts/db-setup.mjs",
     "start:local": "DATABASE_ENGINE=sqlite INTERACTION_MODE=cli node scripts/db-setup.mjs && DATABASE_ENGINE=sqlite INTERACTION_MODE=cli node dist/index.js",

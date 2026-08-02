@@ -13,6 +13,7 @@ import {
     MintOperationError,
     OutputConfig,
     getTokenMetadata,
+    setGlobalRequestOptions,
     sumProofs,
 } from '@cashu/cashu-ts'
 import { ProofStatus } from '@prisma/client'
@@ -21,6 +22,12 @@ import AppError, { Err } from '../utils/AppError'
 import { log } from './logService'
 
 const _wallets = new Map<string, Wallet>()
+
+// cashu-ts enables implicit NUT-19 retries for endpoints advertised as cached.
+// That is useful for ordinary clients, but an approval-gated melt must have one
+// transport attempt: an ambiguous result is reconciled by pay-status instead of
+// silently resubmitting POST /v1/melt/bolt11 inside the library.
+setGlobalRequestOptions({ ttl: 0, cached_endpoints: [] })
 
 const getMintUrls = function (): string[] {
     const raw = process.env.MINT_URLS || ''

@@ -40,8 +40,38 @@ directly; a product embeds it as its wallet engine and supplies the approval UI.
   database. Approval responses expose only hashes and bounded amounts.
 - The full mocked test suite and build pass, including restart, proof
   reservation, preimage verification, and ambiguous-outcome tests.
-- Funded restore reconciliation, testnet/regtest fault injection, and an
-  independent security review are still required before a production release.
+- A two-mint local Nutshell FakeWallet drill now covers an accepted melt whose
+  response is lost, immediate UNKNOWN persistence, and status-only recovery
+  after process restart. It also verifies that cashu-ts cannot silently retry
+  the approved melt through NUT-19 transport caching.
+- Funded restore reconciliation and an independent security review are still
+  required before a production release.
+
+### Opt-in local regtest fault drill
+
+The live-protocol drill is intentionally separate from the ordinary unit test
+suite. It requires Node.js 24+, [`uv`](https://docs.astral.sh/uv/), and an
+official [Nutshell](https://github.com/cashubtc/nutshell) checkout. It creates
+two local `127.0.0.1` FakeWallet mints so a source mint pays an invoice from a
+distinct destination mint, without testnet coins or real sats:
+
+```bash
+IPPON_REGTEST_FAULT_ACK=local-regtest-fake-ecash-only \
+IPPON_NUTSHELL_PATH=/absolute/path/to/nutshell \
+npm run test:regtest-fault
+```
+
+The exact acknowledgement, two loopback-only origins, 255-fake-sat funding cap,
+16-fake-sat payment cap, disposable databases, and secret-free result are
+enforced in the harness. It forwards one accepted melt, discards that response,
+blocks the first reconciliation, restarts Ippon, and permits only `pay-status`
+to recover the operation. The temporary wallets, proofs, mint keys, and
+databases are removed even on failure; `uv` may retain only its public package
+and Python download cache.
+
+Nutshell's FakeWallet is adjusted only inside these acknowledged local test
+processes so its synthetic invoice uses standard 32-byte BOLT11 preimage
+hashing. That test-only hook is never loaded by Ippon or a production mint.
 
 The original project and this fork are distributed under the MIT License. See
 [`LICENSE`](LICENSE). The upstream authorship and Git history are preserved.

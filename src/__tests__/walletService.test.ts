@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
     walletCreateMeltQuoteBolt11: vi.fn(),
     walletCheckMeltQuoteBolt11: vi.fn(),
     walletMeltProofsBolt11: vi.fn(),
+    setGlobalRequestOptions: vi.fn(),
     prismaProofAggregate: vi.fn(),
     prismaProofFindMany: vi.fn(),
     prismaProofCreate: vi.fn(),
@@ -31,6 +32,7 @@ vi.mock('@cashu/cashu-ts', async (importOriginal) => {
     const actual = await importOriginal<typeof import('@cashu/cashu-ts')>()
     return {
         ...actual,
+        setGlobalRequestOptions: mocks.setGlobalRequestOptions,
         Wallet: vi.fn().mockImplementation(() => ({
             loadMint: mocks.walletLoadMint,
             send: mocks.walletSend,
@@ -72,6 +74,16 @@ const makeDbProof = (secret: string, amount = 100) => ({
     id: 1, walletId: 1, proofId: `id-${secret}`, amount, secret,
     C: `C-${secret}`, dleq: null, witness: null, status: ProofStatus.UNSPENT,
     createdAt: new Date(),
+})
+
+describe('Cashu transport safety policy', () => {
+    it('disables implicit NUT-19 retries so approved melts have one HTTP attempt', () => {
+        expect(mocks.setGlobalRequestOptions).toHaveBeenCalledOnce()
+        expect(mocks.setGlobalRequestOptions).toHaveBeenCalledWith({
+            ttl: 0,
+            cached_endpoints: [],
+        })
+    })
 })
 
 // ── tests ─────────────────────────────────────────────────────────────────────
