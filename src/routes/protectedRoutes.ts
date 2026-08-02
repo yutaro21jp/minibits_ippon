@@ -4,8 +4,8 @@ import { FastifyRequest, FastifyPluginCallback, FastifyReply } from 'fastify'
 import {
     MintQuoteState,
     MeltQuoteState,
-    getDecodedToken,
-    getEncodedTokenV4,
+    getTokenMetadata,
+    getEncodedToken,
     CheckStateEnum,
     decodePaymentRequest,
 } from '@cashu/cashu-ts'
@@ -54,7 +54,7 @@ const depositQuoteProps = {
     quote:   { type: 'string' },
     request: { type: 'string', description: 'BOLT11 Lightning invoice' },
     state:   { type: 'string', enum: ['UNPAID', 'PAID', 'ISSUED', 'EXPIRED'] },
-    expiry:  { type: 'integer' },
+    expiry:  { type: 'integer', nullable: true },
 }
 
 // ── Helper to get the wallet from the request (attached by bearerAuthHandler)
@@ -137,8 +137,8 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
             access_key:      wallet.accessKey,
             mint:            wallet.mint,
             unit:            wallet.unit,
-            balance,
-            pending_balance: pendingBalance,
+            balance: balance.toNumber(),
+            pending_balance: pendingBalance.toNumber(),
             limits: (wallet.maxBalance != null || wallet.maxSend != null || wallet.maxPay != null) ? {
                 max_balance: wallet.maxBalance,
                 max_send:    wallet.maxSend,
@@ -179,13 +179,13 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
         const maxBalance = effectiveLimit(wallet.maxBalance, 'MAX_BALANCE', 100000)
         const { balance } = await WalletService.getWalletBalance(wallet.id)
 
-        if (balance + amount > maxBalance) {
+        if (balance.add(amount).greaterThan(maxBalance)) {
             throw new AppError(400, Err.LIMIT_ERROR, `Deposit would exceed max balance of ${maxBalance}`, { caller: 'Deposit', reqId: req.id })
         }
 
         const quote = await WalletService.createMintQuote(amount, wallet.mint)
 
-        log.info('POST /v1/wallet/deposit', { walletId: wallet.id, amount, quote: quote.quote, reqId: req.id })
+        log.info('POST /v1/wallet/deposit', { walletId: wallet.id, amount, reqId: req.id })
 
         return {
             quote: quote.quote,
@@ -224,20 +224,18 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
 
                 log.info('GET /v1/wallet/deposit/:quote - Minted proofs', {
                     walletId: wallet.id,
-                    quoteId,
-                    amount: quote.amount,
+                    amount: quote.amount.toString(),
                     reqId: req.id,
                 })
             } catch (e: any) {
                 log.warn('GET /v1/wallet/deposit/:quote - Mint proofs failed', {
-                    quoteId,
                     error: e.message,
                     reqId: req.id,
                 })
             }
         }
 
-        log.info('GET /v1/wallet/deposit/:quote', { walletId: wallet.id, quoteId, state: quote.state, reqId: req.id })
+        log.info('GET /v1/wallet/deposit/:quote', { walletId: wallet.id, state: quote.state, reqId: req.id })
 
         return {
             quote: quote.quote,
@@ -303,7 +301,7 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
 
         const { send } = await WalletService.sendProofs(wallet.id, amount, wallet.mint, p2pkPubkey)
 
-        const token = getEncodedTokenV4({
+        const token = getEncodedToken({
             mint: wallet.mint,
             proofs: send,
             memo,
@@ -314,7 +312,7 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
 
         return {
             token,
-            amount: WalletService.getProofsAmount(send),
+            amount: WalletService.getProofsAmount(send).toNumber(),
             unit: wallet.unit,
             memo,
         }
@@ -402,7 +400,7 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
         log.info('POST /v1/wallet/check', { walletId: wallet.id, state: overallState, reqId: req.id })
 
         return {
-            amount: WalletService.getProofsAmount(token.proofs),
+            amount: WalletService.getProofsAmount(token.proofs).toNumber(),
             unit: token.unit || wallet.unit,
             memo: token.memo,
             state: overallState,
@@ -448,7 +446,13 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
         switch (type) {
             case 'CASHU_TOKEN_V4':
             case 'CASHU_TOKEN_V3': {
-                decoded = getDecodedToken(data)
+                const metadata = getTokenMetadata(data)
+                decoded = {
+                    mint: metadata.mint,
+                    unit: metadata.unit,
+                    amount: metadata.amount.toNumber(),
+                    incomplete_proofs: metadata.incompleteProofs,
+                }
                 break
             }
 
@@ -462,7 +466,7 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
                 const paymentRequest = decodePaymentRequest(data)
                 decoded = {
                     id: paymentRequest.id,
-                    amount: paymentRequest.amount,
+                    amount: paymentRequest.amount?.toNumber(),
                     unit: paymentRequest.unit,
                     mints: paymentRequest.mints,
                     description: paymentRequest.description,
@@ -555,17 +559,16 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
 
         log.info('POST /v1/wallet/pay', {
             walletId: wallet.id,
-            quoteId: meltResponse.quote.quote,
-            amount: meltResponse.quote.amount,
-            fee: meltResponse.quote.fee_reserve,
+            amount: meltResponse.quote.amount.toString(),
+            fee: meltResponse.quote.fee_reserve.toString(),
             state: meltResponse.quote.state,
             reqId: req.id,
         })
 
         return {
             quote: meltResponse.quote.quote,
-            amount: meltResponse.quote.amount,
-            fee_reserve: meltResponse.quote.fee_reserve,
+            amount: meltResponse.quote.amount.toNumber(),
+            fee_reserve: meltResponse.quote.fee_reserve.toNumber(),
             state: meltResponse.quote.state,
             payment_preimage: meltResponse.quote.payment_preimage,
             expiry: meltResponse.quote.expiry,
@@ -593,12 +596,12 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
 
         const quote = await WalletService.checkMeltQuote(quoteId, wallet.mint)
 
-        log.info('GET /v1/wallet/pay/:quote', { walletId: wallet.id, quoteId, state: quote.state, reqId: req.id })
+        log.info('GET /v1/wallet/pay/:quote', { walletId: wallet.id, state: quote.state, reqId: req.id })
 
         return {
             quote: quote.quote,
-            amount: quote.amount,
-            fee_reserve: quote.fee_reserve,
+            amount: quote.amount.toNumber(),
+            fee_reserve: quote.fee_reserve.toNumber(),
             state: quote.state,
             payment_preimage: quote.payment_preimage,
             expiry: quote.expiry,
@@ -643,11 +646,10 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
         const { balance: currentBalance } = await WalletService.getWalletBalance(wallet.id)
 
         // Decode token to check amount before receiving
-        const decoded = getDecodedToken(tokenStr)
-        const tokenAmount = WalletService.getProofsAmount(decoded.proofs)
+        const tokenAmount = WalletService.getTokenAmount(tokenStr)
 
-        if (currentBalance + tokenAmount > maxBalance) {
-            throw new AppError(400, Err.LIMIT_ERROR, `Receiving ${tokenAmount} would exceed max balance of ${maxBalance}`, { caller: 'Receive', reqId: req.id })
+        if (currentBalance.add(tokenAmount).greaterThan(maxBalance)) {
+            throw new AppError(400, Err.LIMIT_ERROR, `Receiving ${tokenAmount.toString()} would exceed max balance of ${maxBalance}`, { caller: 'Receive', reqId: req.id })
         }
 
         const newProofs = await WalletService.receiveToken(wallet.id, tokenStr, wallet.mint)
@@ -657,10 +659,10 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
         log.info('POST /v1/wallet/receive', { walletId: wallet.id, amount, reqId: req.id })
 
         return {
-            amount,
+            amount: amount.toNumber(),
             unit: wallet.unit,
-            balance,
-            pending_balance: pendingBalance,
+            balance: balance.toNumber(),
+            pending_balance: pendingBalance.toNumber(),
         }
     })
 

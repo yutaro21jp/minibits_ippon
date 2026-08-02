@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { FastifyInstance } from 'fastify'
-import { MintQuoteState, MeltQuoteState } from '@cashu/cashu-ts'
+import { Amount, MintQuoteState, MeltQuoteState } from '@cashu/cashu-ts'
 
 // ── hoisted mock fns ──────────────────────────────────────────────────────────
 
@@ -75,7 +75,7 @@ vi.mock('@cashu/cashu-ts', async (importOriginal) => {
     const actual = await importOriginal<typeof import('@cashu/cashu-ts')>()
     return {
         ...actual,
-        getEncodedTokenV4: vi.fn().mockReturnValue('cashuBmocked_token'),
+        getEncodedToken: vi.fn().mockReturnValue('cashuBmocked_token'),
     }
 })
 
@@ -149,7 +149,10 @@ describe('GET /v1/wallet', () => {
     beforeEach(async () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
-        mocks.getWalletBalance.mockResolvedValue({ balance: 5000, pendingBalance: 0 })
+        mocks.getWalletBalance.mockResolvedValue({
+            balance: Amount.from(5000),
+            pendingBalance: Amount.zero(),
+        })
         app = await buildApp()
         await app.ready()
     })
@@ -171,7 +174,10 @@ describe('POST /v1/wallet/deposit', () => {
     beforeEach(async () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
-        mocks.getWalletBalance.mockResolvedValue({ balance: 0, pendingBalance: 0 })
+        mocks.getWalletBalance.mockResolvedValue({
+            balance: Amount.zero(),
+            pendingBalance: Amount.zero(),
+        })
         mocks.createMintQuote.mockResolvedValue({
             quote: 'quote-id-123',
             request: 'lnbc...',
@@ -207,7 +213,10 @@ describe('POST /v1/wallet/deposit', () => {
     })
 
     it('rejects deposit that would exceed max balance', async () => {
-        mocks.getWalletBalance.mockResolvedValue({ balance: 99000, pendingBalance: 0 })
+        mocks.getWalletBalance.mockResolvedValue({
+            balance: Amount.from(99000),
+            pendingBalance: Amount.zero(),
+        })
         const res = await post(app, '/v1/wallet/deposit', { amount: 5000, unit: 'sat' })
         expect(res.statusCode).toBe(400)
         expect(res.json().error.name).toBe('LIMIT_ERROR')
@@ -236,25 +245,27 @@ describe('GET /v1/wallet/deposit/:quote', () => {
 
     it('mints proofs automatically when quote is paid', async () => {
         mocks.checkMintQuote.mockResolvedValue({
-            quote: 'q1', request: 'lnbc...', state: MintQuoteState.PAID, amount: 1000, expiry: 3600,
+            quote: 'q1', request: 'lnbc...', state: MintQuoteState.PAID,
+            amount: Amount.from(1000), expiry: 3600,
         })
         mocks.mintProofs.mockResolvedValue([{ id: 'p1', amount: 1000, secret: 's1', C: 'C1' }])
         const res = await get(app, '/v1/wallet/deposit/q1')
         expect(res.statusCode).toBe(200)
-        expect(mocks.mintProofs).toHaveBeenCalledWith(1000, 'q1', WALLET.mint)
+        expect(mocks.mintProofs.mock.calls[0][0].toNumber()).toBe(1000)
+        expect(mocks.mintProofs.mock.calls[0].slice(1)).toEqual(['q1', WALLET.mint])
         expect(mocks.saveProofs).toHaveBeenCalled()
     })
 })
 
 describe('POST /v1/wallet/send', () => {
     let app: FastifyInstance
-    const SEND_PROOFS = [{ id: 'p1', amount: 500, secret: 's1', C: 'C1' }]
+    const SEND_PROOFS = [{ id: 'p1', amount: Amount.from(500), secret: 's1', C: 'C1' }]
 
     beforeEach(async () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
         mocks.sendProofs.mockResolvedValue({ keep: [], send: SEND_PROOFS })
-        mocks.getProofsAmount.mockReturnValue(500)
+        mocks.getProofsAmount.mockReturnValue(Amount.from(500))
         app = await buildApp()
         await app.ready()
     })
@@ -309,7 +320,10 @@ describe('POST /v1/wallet/receive', () => {
     beforeEach(async () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
-        mocks.getWalletBalance.mockResolvedValue({ balance: 0, pendingBalance: 0 })
+        mocks.getWalletBalance.mockResolvedValue({
+            balance: Amount.zero(),
+            pendingBalance: Amount.zero(),
+        })
         app = await buildApp()
         await app.ready()
     })
@@ -327,12 +341,12 @@ describe('POST /v1/wallet/pay', () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
         mocks.createMeltQuote.mockResolvedValue({
-            quote: 'melt-q1', amount: 1000, fee_reserve: 10,
+            quote: 'melt-q1', amount: Amount.from(1000), fee_reserve: Amount.from(10),
             state: MeltQuoteState.UNPAID, expiry: 3600,
         })
         mocks.meltProofs.mockResolvedValue({
             quote: {
-                quote: 'melt-q1', amount: 1000, fee_reserve: 10,
+                quote: 'melt-q1', amount: Amount.from(1000), fee_reserve: Amount.from(10),
                 state: MeltQuoteState.PAID, payment_preimage: 'preimage', expiry: 3600,
             },
             change: [],
@@ -399,7 +413,7 @@ describe('GET /v1/wallet/pay/:quote', () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
         mocks.checkMeltQuote.mockResolvedValue({
-            quote: 'melt-q1', amount: 1000, fee_reserve: 10,
+            quote: 'melt-q1', amount: Amount.from(1000), fee_reserve: Amount.from(10),
             state: MeltQuoteState.PAID, payment_preimage: 'pi', expiry: 3600,
         })
         app = await buildApp()

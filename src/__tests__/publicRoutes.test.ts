@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { FastifyInstance } from 'fastify'
+import { Amount } from '@cashu/cashu-ts'
 
 // ── hoisted mock fns (available inside vi.mock factories) ───────────────────
 
@@ -8,6 +9,7 @@ const mocks = vi.hoisted(() => ({
     prismaWalletDelete: vi.fn(),
     prismaProofDeleteMany: vi.fn(),
     receiveToken: vi.fn(),
+    getTokenAmount: vi.fn(),
     getProofsAmount: vi.fn(),
 }))
 
@@ -33,6 +35,7 @@ vi.mock('../services/walletService', () => ({
     WalletService: {
         getMintUrls: vi.fn().mockReturnValue(['https://testmint.example.com']),
         receiveToken: mocks.receiveToken,
+        getTokenAmount: mocks.getTokenAmount,
         getProofsAmount: mocks.getProofsAmount,
         getWalletBalance: vi.fn().mockResolvedValue({ balance: 0, pendingBalance: 0 }),
         sendProofs: vi.fn(),
@@ -98,6 +101,7 @@ describe('POST /v1/wallet', () => {
     beforeEach(async () => {
         vi.clearAllMocks()
         mocks.prismaWalletCreate.mockResolvedValue(CREATED_WALLET)
+        mocks.getTokenAmount.mockReturnValue(Amount.from(1))
         app = await buildApp()
         await app.ready()
     })
@@ -122,7 +126,8 @@ describe('POST /v1/wallet', () => {
     it('creates a wallet and receives initial token', async () => {
         const mockProofs = [{ id: 'p1', amount: 100, secret: 'sec1', C: 'C1' }]
         mocks.receiveToken.mockResolvedValue(mockProofs)
-        mocks.getProofsAmount.mockReturnValue(100)
+        mocks.getTokenAmount.mockReturnValue(Amount.from(100))
+        mocks.getProofsAmount.mockReturnValue(Amount.from(100))
 
         const res = await app.inject({
             method: 'POST',
@@ -140,7 +145,7 @@ describe('POST /v1/wallet', () => {
     it('rejects token that exceeds max balance', async () => {
         const bigProofs = [{ id: 'p1', amount: 999999, secret: 'sec1', C: 'C1' }]
         mocks.receiveToken.mockResolvedValue(bigProofs)
-        mocks.getProofsAmount.mockReturnValue(999999)
+        mocks.getTokenAmount.mockReturnValue(Amount.from(999999))
 
         const res = await app.inject({
             method: 'POST',
@@ -151,7 +156,6 @@ describe('POST /v1/wallet', () => {
 
         expect(res.statusCode).toBe(400)
         expect(res.json().error.name).toBe('LIMIT_ERROR')
-        expect(mocks.prismaProofDeleteMany).toHaveBeenCalled()
         expect(mocks.prismaWalletDelete).toHaveBeenCalled()
     })
 

@@ -15,7 +15,7 @@
     "prisma:updateDb": "npx prisma db push"
   },
   "dependencies": {
-    "@cashu/cashu-ts": "3.4.1",
+    "@cashu/cashu-ts": "4.7.2",
     "@fastify/bearer-auth": "^10.1.1",
     "@fastify/rate-limit": "^10.3.0",
     "@fastify/swagger": "^9.7.0",

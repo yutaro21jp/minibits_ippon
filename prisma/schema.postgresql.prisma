@@ -8,17 +8,18 @@ datasource db {
 }
 
 model Wallet {
-  id              Int       @id @default(autoincrement())
-  accessKey       String    @unique
-  name            String?
-  mint            String
-  unit            String    @default("sat")
-  maxBalance      Int?
-  maxSend         Int?
-  maxPay          Int?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime?
-  proofs          Proof[]
+  id             Int             @id @default(autoincrement())
+  accessKey      String          @unique
+  name           String?
+  mint           String
+  unit           String          @default("sat")
+  maxBalance     Int?
+  maxSend        Int?
+  maxPay         Int?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime?
+  proofs         Proof[]
+  meltOperations MeltOperation[]
 }
 
 enum ProofStatus {
@@ -27,16 +28,58 @@ enum ProofStatus {
   SPENT
 }
 
+enum MeltOperationState {
+  PREPARED
+  EXECUTING
+  PENDING
+  UNKNOWN
+  PAID
+  UNPAID
+  EXPIRED
+}
+
 model Proof {
-  id        Int         @id @default(autoincrement())
-  walletId  Int
-  wallet    Wallet      @relation(fields: [walletId], references: [id])
-  proofId   String
-  amount    Int
-  secret    String      @unique
-  C         String
-  dleq      String?
-  witness   String?
-  status    ProofStatus @default(UNSPENT)
-  createdAt DateTime    @default(now())
+  id                  Int            @id @default(autoincrement())
+  walletId            Int
+  wallet              Wallet         @relation(fields: [walletId], references: [id])
+  proofId             String
+  amount              Int
+  secret              String         @unique
+  C                   String
+  dleq                String?
+  witness             String?
+  p2pkE               String?
+  status              ProofStatus    @default(UNSPENT)
+  reservedByIntentId  String?
+  reservedByOperation MeltOperation? @relation("ReservedMeltProofs", fields: [reservedByIntentId], references: [intentId], onDelete: Restrict)
+  createdAt           DateTime       @default(now())
+
+  @@index([walletId, status, reservedByIntentId])
+}
+
+model MeltOperation {
+  intentId           String             @id
+  walletId           Int
+  wallet             Wallet             @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  quoteId            String             @unique
+  request            String
+  amount             Int
+  feeReserve         Int
+  inputFee           Int
+  maxSpend           Int
+  expiry             BigInt
+  keysetId           String
+  selectedProofsJson String
+  changeOutputsJson  String
+  state              MeltOperationState @default(PREPARED)
+  executionCount     Int                @default(0)
+  lastQuoteState     String?
+  errorCode          String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  executedAt         DateTime?
+  reconciledAt       DateTime?
+  reservedProofs     Proof[]            @relation("ReservedMeltProofs")
+
+  @@index([walletId, state])
 }

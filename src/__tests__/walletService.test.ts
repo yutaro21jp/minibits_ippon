@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { MeltQuoteState, CheckStateEnum, MintOperationError } from '@cashu/cashu-ts'
+import { Amount, MeltQuoteState, CheckStateEnum, MintOperationError } from '@cashu/cashu-ts'
 import { ProofStatus } from '@prisma/client'
 
 // ── hoisted mock fns ──────────────────────────────────────────────────────────
@@ -65,7 +65,7 @@ import { WalletService } from '../services/walletService'
 // ── fixtures ───────────────────────────────────────────────────────────────────
 
 const makeProof = (secret: string, amount = 100) => ({
-    id: `id-${secret}`, amount, secret, C: `C-${secret}`,
+    id: `id-${secret}`, amount: Amount.from(amount), secret, C: `C-${secret}`,
 })
 
 const makeDbProof = (secret: string, amount = 100) => ({
@@ -79,11 +79,11 @@ const makeDbProof = (secret: string, amount = 100) => ({
 describe('WalletService.getProofsAmount', () => {
     it('sums proof amounts', () => {
         const proofs = [makeProof('a', 100), makeProof('b', 200), makeProof('c', 50)]
-        expect(WalletService.getProofsAmount(proofs)).toBe(350)
+        expect(WalletService.getProofsAmount(proofs).toNumber()).toBe(350)
     })
 
     it('returns 0 for empty array', () => {
-        expect(WalletService.getProofsAmount([])).toBe(0)
+        expect(WalletService.getProofsAmount([]).toNumber()).toBe(0)
     })
 })
 
@@ -96,8 +96,8 @@ describe('WalletService.getWalletBalance', () => {
             .mockResolvedValueOnce({ _sum: { amount: 300 } })
 
         const result = await WalletService.getWalletBalance(1)
-        expect(result.balance).toBe(5000)
-        expect(result.pendingBalance).toBe(300)
+        expect(result.balance.toNumber()).toBe(5000)
+        expect(result.pendingBalance.toNumber()).toBe(300)
     })
 
     it('returns 0 when no proofs exist', async () => {
@@ -106,8 +106,8 @@ describe('WalletService.getWalletBalance', () => {
             .mockResolvedValueOnce({ _sum: { amount: null } })
 
         const result = await WalletService.getWalletBalance(1)
-        expect(result.balance).toBe(0)
-        expect(result.pendingBalance).toBe(0)
+        expect(result.balance.toNumber()).toBe(0)
+        expect(result.pendingBalance.toNumber()).toBe(0)
     })
 })
 
@@ -122,6 +122,13 @@ describe('WalletService.syncProofsStateWithMint', () => {
         const result = await WalletService.syncProofsStateWithMint(1, 'https://testmint.example.com')
         expect(result).toEqual({ spent: 0, pending: 0, unspent: 0 })
         expect(mocks.walletCheckProofsStates).not.toHaveBeenCalled()
+        expect(mocks.prismaProofFindMany).toHaveBeenCalledWith({
+            where: {
+                walletId: 1,
+                status: ProofStatus.PENDING,
+                reservedByIntentId: null,
+            },
+        })
     })
 
     it('marks SPENT proofs correctly', async () => {
@@ -208,12 +215,12 @@ describe('WalletService.sendProofs', () => {
         const pubkey = '02' + '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798'
         await WalletService.sendProofs(WALLET_ID, 100, 'https://testmint.example.com', pubkey)
 
-        expect(mocks.walletSend).toHaveBeenCalledWith(
-            100,
+        expect(mocks.walletSend.mock.calls[0][0].toNumber()).toBe(100)
+        expect(mocks.walletSend.mock.calls[0].slice(1)).toEqual([
             expect.any(Array),
             { includeFees: true },
             { send: { type: 'p2pk', options: { pubkey } } },
-        )
+        ])
     })
 
     it('calls wallet.send without outputConfig when no pubkey', async () => {
@@ -227,16 +234,17 @@ describe('WalletService.sendProofs', () => {
 
         await WalletService.sendProofs(WALLET_ID, 100, 'https://testmint.example.com')
 
-        expect(mocks.walletSend).toHaveBeenCalledWith(
-            100, expect.any(Array), { includeFees: true }, undefined,
-        )
+        expect(mocks.walletSend.mock.calls[0][0].toNumber()).toBe(100)
+        expect(mocks.walletSend.mock.calls[0].slice(1)).toEqual([
+            expect.any(Array), { includeFees: true }, undefined,
+        ])
     })
 })
 
 describe('WalletService.meltProofs — error handling', () => {
     const WALLET_ID = 1
     const MELT_QUOTE = {
-        quote: 'mq1', amount: 500, fee_reserve: 10,
+        quote: 'mq1', amount: Amount.from(500), fee_reserve: Amount.from(10),
         state: MeltQuoteState.UNPAID, expiry: 3600,
         unit: 'sat', request: 'lnbc...', payment_preimage: null,
     }

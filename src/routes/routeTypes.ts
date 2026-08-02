@@ -68,7 +68,7 @@ export interface WalletDepositResponse {
     quote:   string
     request: string
     state:   string
-    expiry:  number
+    expiry:  number | null
 }
 
 // ── GET /v1/wallet/deposit/:quote ────────────────────────────────────────────

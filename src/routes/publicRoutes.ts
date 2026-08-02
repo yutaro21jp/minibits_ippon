@@ -153,14 +153,14 @@ export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
         if (token) {
             const maxBalance = wallet.maxBalance ?? parseInt(process.env.MAX_BALANCE || '100000')
             const tokenAmount = WalletService.getTokenAmount(token)
-            if (tokenAmount > maxBalance) {
+            if (tokenAmount.greaterThan(maxBalance)) {
                 await prisma.wallet.delete({ where: { id: wallet.id } })
-                throw new AppError(400, Err.LIMIT_ERROR, `Token amount ${tokenAmount} exceeds max balance ${maxBalance}`, { caller: 'CreateWallet' })
+                throw new AppError(400, Err.LIMIT_ERROR, `Token amount ${tokenAmount.toString()} exceeds max balance ${maxBalance}`, { caller: 'CreateWallet' })
             }
 
             try {
                 const newProofs = await WalletService.receiveToken(wallet.id, token, resolvedMintUrl)
-                balance = WalletService.getProofsAmount(newProofs)
+                balance = WalletService.getProofsAmount(newProofs).toNumber()
             } catch (e: any) {
                 if (e instanceof AppError) throw e
                 await prisma.wallet.delete({ where: { id: wallet.id } })

@@ -3,13 +3,14 @@ import readline from 'readline'
 import crypto from 'crypto'
 import {
     MintQuoteState,
-    getDecodedToken,
-    getEncodedTokenV4,
+    getTokenMetadata,
+    getEncodedToken,
     decodePaymentRequest,
 } from '@cashu/cashu-ts'
 import { decode as bolt11Decode } from '@gandlaf21/bolt11-decode'
 import prisma from './utils/prismaClient'
 import { WalletService } from './services/walletService'
+import { SplitMeltError, SplitMeltService } from './services/splitMeltService'
 import { NostrService } from './services/nostrService'
 import { log } from './services/logService'
 
@@ -60,8 +61,9 @@ async function handleCommand(parts: string[]): Promise<void> {
                 'wallet <key> deposit-check <quote_id>',
                 'wallet <key> send <amount> [lock_pubkey]',
                 'wallet <key> receive <token>',
-                'wallet <key> pay <bolt11_or_lightning_address> [amount_sats]',
-                'wallet <key> pay-check <quote_id>',
+                'wallet <key> pay-prepare <intent_id> <bolt11>',
+                'wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>',
+                'wallet <key> pay-status <intent_id>',
                 'wallet <key> sync',
                 'decode <cashu_token_or_bolt11_or_cashu_request>',
                 'help',
@@ -81,6 +83,14 @@ async function handleCommand(parts: string[]): Promise<void> {
                 max_send:    parseInt(process.env.MAX_SEND    || '50000'),
                 max_pay:     parseInt(process.env.MAX_PAY     || '50000'),
             },
+            payment_adapter: {
+                protocol_version: 1,
+                cashu_ts_version: '4.7.2',
+                split_melt: true,
+                persistent_operations: true,
+                proof_state_reconciliation: true,
+                preimage_verification: true,
+            },
         })
         return
     }
@@ -91,7 +101,16 @@ async function handleCommand(parts: string[]): Promise<void> {
         if (!data) { cliError('Usage: decode <data>'); return }
         try {
             if (data.startsWith('cashu')) {
-                out({ type: 'CASHU_TOKEN', decoded: getDecodedToken(data) })
+                const metadata = getTokenMetadata(data)
+                out({
+                    type: 'CASHU_TOKEN',
+                    decoded: {
+                        mint: metadata.mint,
+                        unit: metadata.unit,
+                        amount: metadata.amount.toNumber(),
+                        incomplete_proofs: metadata.incompleteProofs,
+                    },
+                })
             } else if (data.startsWith('creq')) {
                 out({ type: 'CASHU_REQUEST', decoded: decodePaymentRequest(data) })
             } else {
@@ -159,8 +178,8 @@ async function handleCommand(parts: string[]): Promise<void> {
                         name:            w.name || '',
                         mint:            w.mint,
                         unit:            w.unit,
-                        balance,
-                        pending_balance: pendingBalance,
+                        balance: balance.toNumber(),
+                        pending_balance: pendingBalance.toNumber(),
                     }
                 }))
                 out({ wallets: rows })
@@ -195,8 +214,8 @@ async function handleCommand(parts: string[]): Promise<void> {
                     name:            wallet.name || '',
                     mint:            wallet.mint,
                     unit:            wallet.unit,
-                    balance,
-                    pending_balance: pendingBalance,
+                    balance: balance.toNumber(),
+                    pending_balance: pendingBalance.toNumber(),
                 })
             } catch (e: any) { cliError(e.message) }
             return
@@ -240,8 +259,8 @@ async function handleCommand(parts: string[]): Promise<void> {
                 let p2pkPubkey: string | undefined
                 if (parts[4]) p2pkPubkey = NostrService.normalizePubkey(parts[4])
                 const { send } = await WalletService.sendProofs(wallet.id, amount, wallet.mint, p2pkPubkey)
-                const token = getEncodedTokenV4({ mint: wallet.mint, proofs: send, unit: wallet.unit })
-                out({ token, amount: WalletService.getProofsAmount(send), unit: wallet.unit })
+                const token = getEncodedToken({ mint: wallet.mint, proofs: send, unit: wallet.unit })
+                out({ token, amount: WalletService.getProofsAmount(send).toNumber(), unit: wallet.unit })
             } catch (e: any) { cliError(e.message) }
             return
         }
@@ -254,59 +273,82 @@ async function handleCommand(parts: string[]): Promise<void> {
                 const newProofs = await WalletService.receiveToken(wallet.id, tokenStr, wallet.mint)
                 const amount = WalletService.getProofsAmount(newProofs)
                 const { balance, pendingBalance } = await WalletService.getWalletBalance(wallet.id)
-                out({ amount, unit: wallet.unit, balance, pending_balance: pendingBalance })
+                out({
+                    amount: amount.toNumber(),
+                    unit: wallet.unit,
+                    balance: balance.toNumber(),
+                    pending_balance: pendingBalance.toNumber(),
+                })
             } catch (e: any) { cliError(e.message) }
             return
         }
 
-        // pay <bolt11_or_lnaddress> [amount_sats]
+        // The old one-shot pay path is unsafe because it creates a quote and
+        // spends proofs before an external approval can bind the exact plan.
         if (op === 'pay') {
-            const target = parts[3]
-            if (!target) { cliError('Usage: wallet <key> pay <bolt11_or_lightning_address> [amount_sats]'); return }
-            const amount = parseInt(parts[4]) || 0
-            try {
-                let invoice = target
-                if (target.includes('@') && !target.toLowerCase().startsWith('lnbc')) {
-                    const [name, domain] = target.split('@')
-                    const lnurlRes = await fetch(`https://${domain}/.well-known/lnurlp/${name}`)
-                    const lnurlData = await lnurlRes.json() as any
-                    if (lnurlData.status === 'ERROR') throw new Error(lnurlData.reason || 'LNURL error')
-                    const callbackUrl = new URL(lnurlData.callback)
-                    callbackUrl.searchParams.set('amount', String(amount * 1000))
-                    const invRes = await fetch(callbackUrl.toString())
-                    const invData = await invRes.json() as any
-                    if (invData.status === 'ERROR') throw new Error(invData.reason || 'Invoice fetch failed')
-                    invoice = invData.pr
-                }
-                const meltQuote = await WalletService.createMeltQuote(invoice, wallet.mint)
-                const meltResponse = await WalletService.meltProofs(wallet.id, meltQuote, wallet.mint)
-                out({
-                    quote:            meltResponse.quote.quote,
-                    amount:           meltResponse.quote.amount,
-                    fee_reserve:      meltResponse.quote.fee_reserve,
-                    state:            meltResponse.quote.state,
-                    payment_preimage: meltResponse.quote.payment_preimage,
-                    expiry:           meltResponse.quote.expiry,
-                })
-            } catch (e: any) { cliError(e.message) }
+            cliError(
+                'One-shot pay is disabled; use pay-prepare, obtain approval, then use pay-execute',
+                'UNSAFE_OPERATION',
+            )
             return
         }
 
-        // pay-check <quote_id>
+        // Raw quote IDs never cross the private Ippon CLI boundary.
         if (op === 'pay-check') {
-            const quoteId = parts[3]
-            if (!quoteId) { cliError('Usage: wallet <key> pay-check <quote_id>'); return }
+            cliError('Raw quote lookup is disabled; use pay-status with an intent ID', 'UNSAFE_OPERATION')
+            return
+        }
+
+        // pay-prepare <intent_id> <bolt11>
+        if (op === 'pay-prepare') {
+            const intentId = parts[3]
+            const invoice = parts[4]
+            if (!intentId || !invoice) {
+                cliError('Usage: wallet <key> pay-prepare <intent_id> <bolt11>', 'VALIDATION_ERROR')
+                return
+            }
             try {
-                const quote = await WalletService.checkMeltQuote(quoteId, wallet.mint)
-                out({
-                    quote:            quote.quote,
-                    amount:           quote.amount,
-                    fee_reserve:      quote.fee_reserve,
-                    state:            quote.state,
-                    payment_preimage: quote.payment_preimage,
-                    expiry:           quote.expiry,
-                })
-            } catch (e: any) { cliError(e.message) }
+                out(await SplitMeltService.prepare(wallet, intentId, invoice))
+            } catch (e: any) {
+                cliError(e.message, e instanceof SplitMeltError ? e.code : 'PAYMENT_PREPARE_ERROR')
+            }
+            return
+        }
+
+        // pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>
+        if (op === 'pay-execute') {
+            const [intentId, invoiceSha256, quoteSha256, proofPlanSha256] = parts.slice(3, 7)
+            if (!intentId || !invoiceSha256 || !quoteSha256 || !proofPlanSha256) {
+                cliError(
+                    'Usage: wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>',
+                    'VALIDATION_ERROR',
+                )
+                return
+            }
+            try {
+                out(await SplitMeltService.execute(wallet, intentId, {
+                    invoiceSha256,
+                    quoteSha256,
+                    proofPlanSha256,
+                }))
+            } catch (e: any) {
+                cliError(e.message, e instanceof SplitMeltError ? e.code : 'PAYMENT_EXECUTE_ERROR')
+            }
+            return
+        }
+
+        // pay-status <intent_id>
+        if (op === 'pay-status') {
+            const intentId = parts[3]
+            if (!intentId) {
+                cliError('Usage: wallet <key> pay-status <intent_id>', 'VALIDATION_ERROR')
+                return
+            }
+            try {
+                out(await SplitMeltService.status(wallet, intentId))
+            } catch (e: any) {
+                cliError(e.message, e instanceof SplitMeltError ? e.code : 'PAYMENT_STATUS_ERROR')
+            }
             return
         }
 
@@ -343,6 +385,7 @@ export function startCli(): Promise<void> {
 
         // Track the in-flight async handler so the 'close' handler can await it.
         let currentOp: Promise<void> | null = null
+        let closing = false
 
         rl.on('line', (line: string) => {
             const trimmed = line.trim()
@@ -350,6 +393,7 @@ export function startCli(): Promise<void> {
 
             if (trimmed === 'exit' || trimmed === 'quit') {
                 process.stderr.write('Bye!\n')
+                closing = true
                 rl.close()
                 return
             }
@@ -361,11 +405,12 @@ export function startCli(): Promise<void> {
                 } catch (e: any) {
                     cliError(e.message)
                 }
-                rl.prompt()
+                if (!closing) rl.prompt()
             })()
         })
 
         rl.on('close', () => {
+            closing = true
             // Await the in-flight operation (if any) before disconnecting.
             const cleanup = async () => {
                 if (currentOp) await currentOp

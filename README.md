@@ -291,7 +291,7 @@ All commands are typed at the `> ` prompt (or piped via stdin). Every response i
 
 | Command | Description |
 |---|---|
-| `info` | Service info: mints, unit, global limits |
+| `info` | Service info: mints, unit, global limits, and the split-payment adapter contract |
 | `wallet create [name] [mint_url]` | Create a new wallet; mint must be in `MINT_URLS`; prints `access_key` |
 | `wallet list` | List all wallets with balances |
 | `wallet <key> balance` | Show wallet balance and details; auto-syncs pending proofs with the mint first |
@@ -299,8 +299,9 @@ All commands are typed at the `> ` prompt (or piped via stdin). Every response i
 | `wallet <key> deposit-check <quote_id>` | Check deposit status; auto-mints ecash when paid |
 | `wallet <key> send <amount> [lock_pubkey]` | Export a Cashu token (optionally P2PK-locked) |
 | `wallet <key> receive <token>` | Import a Cashu token |
-| `wallet <key> pay <bolt11\|ln_address> [amount]` | Pay a Lightning invoice or Lightning address |
-| `wallet <key> pay-check <quote_id>` | Check payment status |
+| `wallet <key> pay-prepare <intent_id> <bolt11>` | Create and persist a quote and exact proof plan without paying |
+| `wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>` | Execute the approved, unchanged plan once |
+| `wallet <key> pay-status <intent_id>` | Reconcile quote and proof states without retrying the melt |
 | `wallet <key> sync` | Sync pending proofs with the mint |
 | `decode <data>` | Decode a Cashu token, Cashu request, or BOLT11 invoice |
 | `help` | Show available commands |
@@ -321,9 +322,17 @@ All commands are typed at the `> ` prompt (or piped via stdin). Every response i
 > wallet adg-08m balance
 {"access_key":"adg-08m","name":"agent-session-1","mint":"https://mint.minibits.cash/Bitcoin","unit":"sat","balance":100,"pending_balance":0}
 
-> wallet adg-08m pay lnbc500n...
-{"quote":"xyz987...","amount":50,"fee_reserve":1,"state":"PAID","payment_preimage":"...","expiry":1234567890}
+> wallet adg-08m pay-prepare wallet_0123456789abcdef01234567 lnbc500n...
+{"intent_id":"wallet_0123456789abcdef01234567","state":"PREPARED","amount":50,"fee_reserve":1,"input_fee":1,"max_spend":52,"expiry":1234567890,"payment_hash":"...","invoice_sha256":"...","quote_sha256":"...","proof_plan_sha256":"..."}
+
+> wallet adg-08m pay-execute wallet_0123456789abcdef01234567 <invoice_sha256> <quote_sha256> <proof_plan_sha256>
+{"intent_id":"wallet_0123456789abcdef01234567","state":"PAID","quote_state":"PAID","proof_states":["SPENT"],"payment_preimage":"...","error_code":null}
 ```
+
+The prepare response deliberately omits the raw quote ID, invoice, proofs, and change outputs.
+Those values stay in the private Ippon database. The three hashes must be bound to an external
+approval before `pay-execute` is called. The legacy one-shot `pay` and raw-ID `pay-check` commands
+return `UNSAFE_OPERATION`.
 
 ### Piping commands (non-interactive)
 
@@ -337,8 +346,8 @@ KEY=$(echo "wallet create bot" | DATABASE_ENGINE=sqlite INTERACTION_MODE=cli LOG
 # Receive a token
 echo "wallet $KEY receive cashuB..." | DATABASE_ENGINE=sqlite INTERACTION_MODE=cli LOG_LEVEL=error node dist/index.js 2>/dev/null
 
-# Pay an invoice
-echo "wallet $KEY pay lnbc..." | DATABASE_ENGINE=sqlite INTERACTION_MODE=cli LOG_LEVEL=error node dist/index.js 2>/dev/null
+# Payment is intentionally not a one-line pipe: call pay-prepare, bind its
+# hashes to an external approval, and only then call pay-execute once.
 ```
 
 ## Environment variables
@@ -434,6 +443,7 @@ The test suite uses [Vitest](https://vitest.dev/) and covers three layers:
 |---|---|
 | `src/__tests__/nostrService.test.ts` | Unit — pubkey normalisation (npub / x-only hex / compressed hex) |
 | `src/__tests__/walletService.test.ts` | Unit — `WalletService` methods with Prisma and cashu-ts mocked |
+| `src/__tests__/splitMeltService.test.ts` | Unit — prepare/execute separation, restart recovery, reconciliation, and failure injection |
 | `src/__tests__/publicRoutes.test.ts` | Integration — unauthenticated routes (`GET /v1/info`, `POST /v1/wallet`) |
 | `src/__tests__/protectedRoutes.test.ts` | Integration — all authenticated routes via Fastify `inject()` |
 
@@ -445,7 +455,7 @@ yarn test
 yarn test:watch
 ```
 
-All external I/O (Prisma, cashu-ts `Wallet`, `getEncodedTokenV4`, fetch) is mocked; no database or mint connection is required.
+All external I/O (Prisma, cashu-ts `Wallet`, token encoding, fetch) is mocked; no database or mint connection is required.
 
 ### MCP server
 
@@ -456,4 +466,3 @@ The companion [minibits_ippon_mcp](https://github.com/minibits-cash/minibits_ipp
 - [x] lock token to pubkey
 - [ ] pay cashu payment request
 - [ ] add transactions model and API
-
