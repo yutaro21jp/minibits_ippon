@@ -96,8 +96,21 @@ Nutshell's FakeWallet is adjusted only inside these acknowledged local test
 processes so its synthetic invoice uses standard 32-byte BOLT11 preimage
 hashing. That test-only hook is never loaded by Ippon or a production mint.
 
-The original project and this fork are distributed under the MIT License. See
-[`LICENSE`](LICENSE). The upstream authorship and Git history are preserved.
+## Open-source maintenance
+
+This fork is distributed under the [MIT License](LICENSE). It preserves the
+upstream Git history and attribution; [`NOTICE`](NOTICE) explains the
+relationship to the original project and the fork's modifications.
+
+- Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
+- Report security issues privately as described in [`SECURITY.md`](SECURITY.md).
+- Standard CI runs the complete mocked test suite (including private SQLite
+  path checks) and the build. The acknowledged two-mint regtest remains an
+  opt-in local test because it starts loopback services and requires a separate
+  Nutshell checkout.
+
+The hosted instance described below is operated by the upstream project. It
+does not demonstrate or deploy this fork's approval-gated local CLI adapter.
 
 Minibits Ippon is a minimalistic ecash and Lightning wallet implementing the Cashu protocol. It can be operated as a **REST API server** (for hosted deployments and AI agents connecting over HTTP) or as a **local CLI** (for AI agents that install and control it directly via standard I/O).
 

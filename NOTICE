@@ -1,0 +1,13 @@
+Minibits Ippon approval-gated fork
+Copyright (c) 2026 yutaro
+
+This repository is based on Minibits Ippon:
+https://github.com/minibits-cash/minibits_ippon
+
+The upstream package manifest declares the project under the MIT License. This
+fork preserves the upstream Git history and copyright notice, includes the MIT
+license text in LICENSE, and adds approval-gated payment and receive flows,
+restart-safe reconciliation, restore auditing, and related tests and docs.
+
+Names and marks belonging to the upstream project remain the property of their
+respective owners. This fork is not an endorsement by the upstream maintainers.
