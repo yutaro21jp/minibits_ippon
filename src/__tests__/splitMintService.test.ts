@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
     mintOperationCreate: vi.fn(),
     mintOperationUpdate: vi.fn(),
     mintOperationUpdateMany: vi.fn(),
+    mintOperationAggregate: vi.fn(),
     proofFindUnique: vi.fn(),
     proofCreate: vi.fn(),
     proofAggregate: vi.fn(),
@@ -49,6 +50,7 @@ vi.mock('../utils/prismaClient', () => ({
             create: mocks.mintOperationCreate,
             update: mocks.mintOperationUpdate,
             updateMany: mocks.mintOperationUpdateMany,
+            aggregate: mocks.mintOperationAggregate,
         },
         proof: {
             findUnique: mocks.proofFindUnique,
@@ -149,6 +151,7 @@ describe('SplitMintService', () => {
         mocks.getKeyset.mockReturnValue({ id: 'keyset-1', unit: 'sat', keys: {} })
 
         mocks.mintOperationFindUnique.mockImplementation(async () => operation)
+        mocks.mintOperationAggregate.mockResolvedValue({ _sum: { amount: null } })
         mocks.mintOperationFindUniqueOrThrow.mockImplementation(async () => {
             if (!operation) throw new Error('not found')
             return operation
@@ -283,6 +286,20 @@ describe('SplitMintService', () => {
         })
 
         await expect(SplitMintService.prepare(storedWallet, INTENT_ID, 1))
+            .rejects.toMatchObject({ code: 'BALANCE_LIMIT_EXCEEDED' })
+
+        expect(mocks.createLockedMintQuote).not.toHaveBeenCalled()
+        expect(operation).toBeNull()
+    })
+
+    it('reserves unresolved receive amounts within the balance boundary', async () => {
+        mocks.mintOperationAggregate.mockResolvedValueOnce({ _sum: { amount: 480 } })
+
+        await expect(SplitMintService.prepare(
+            { ...storedWallet, maxBalance: 512 },
+            INTENT_ID,
+            64,
+        ))
             .rejects.toMatchObject({ code: 'BALANCE_LIMIT_EXCEEDED' })
 
         expect(mocks.createLockedMintQuote).not.toHaveBeenCalled()
