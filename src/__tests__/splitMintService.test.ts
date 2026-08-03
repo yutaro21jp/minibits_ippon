@@ -9,6 +9,7 @@ const NOW = 2_000_000_000
 
 const mocks = vi.hoisted(() => ({
     getWallet: vi.fn(),
+    getWalletBalance: vi.fn(),
     proofStorageData: vi.fn(),
     createLockedMintQuote: vi.fn(),
     prepareMint: vi.fn(),
@@ -35,6 +36,7 @@ vi.mock('@gandlaf21/bolt11-decode', () => ({
 vi.mock('../services/walletService', () => ({
     WalletService: {
         getWallet: mocks.getWallet,
+        getWalletBalance: mocks.getWalletBalance,
         proofStorageData: mocks.proofStorageData,
     },
 }))
@@ -120,6 +122,10 @@ describe('SplitMintService', () => {
         storedProofs.clear()
 
         mocks.getWallet.mockResolvedValue(wallet)
+        mocks.getWalletBalance.mockResolvedValue({
+            balance: Amount.zero(),
+            pendingBalance: Amount.zero(),
+        })
         mocks.createLockedMintQuote.mockImplementation(async (_amount, pubkey) => (
             quote(MintQuoteState.UNPAID, pubkey)
         ))
@@ -268,6 +274,19 @@ describe('SplitMintService', () => {
         expect(operation.state).toBe(MintOperationState.UNKNOWN)
         expect(operation.executionCount).toBe(0)
         expect(mocks.completeMint).not.toHaveBeenCalled()
+    })
+
+    it('rejects a receive that would cross the reviewed balance boundary', async () => {
+        mocks.getWalletBalance.mockResolvedValueOnce({
+            balance: Amount.from(2_147_483_647),
+            pendingBalance: Amount.zero(),
+        })
+
+        await expect(SplitMintService.prepare(storedWallet, INTENT_ID, 1))
+            .rejects.toMatchObject({ code: 'BALANCE_LIMIT_EXCEEDED' })
+
+        expect(mocks.createLockedMintQuote).not.toHaveBeenCalled()
+        expect(operation).toBeNull()
     })
 
     it('issues once, stores proofs atomically, and clears bearer recovery material', async () => {

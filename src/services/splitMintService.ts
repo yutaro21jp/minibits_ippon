@@ -301,6 +301,18 @@ async function prepare(
     const existing = await prisma.mintOperation.findUnique({ where: { intentId } })
     if (existing) fail('DUPLICATE_INTENT', 'The receive intent already exists')
 
+    const { balance, pendingBalance } = await WalletService.getWalletBalance(storedWallet.id)
+    const effectiveMaxBalance = Amount.from(
+        storedWallet.maxBalance ?? process.env.MAX_BALANCE ?? MAX_BOUNDARY_AMOUNT,
+    )
+    if (
+        effectiveMaxBalance.lessThanOrEqual(Amount.zero())
+        || effectiveMaxBalance.greaterThan(MAX_BOUNDARY_AMOUNT)
+        || balance.add(pendingBalance).add(rawAmount).greaterThan(effectiveMaxBalance)
+    ) {
+        fail('BALANCE_LIMIT_EXCEEDED', 'The receive would exceed the reviewed balance boundary')
+    }
+
     const { privkey, pubkey } = generateQuoteKey()
     let operation = await prisma.mintOperation.create({
         data: {
