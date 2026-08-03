@@ -10,13 +10,15 @@
  */
 
 import { config } from 'dotenv'
-import { copyFileSync, existsSync, mkdirSync } from 'fs'
+import { copyFileSync, existsSync } from 'fs'
 import { execSync } from 'child_process'
 import path from 'path'
 import os from 'os'
 import { fileURLToPath } from 'url'
+import { ensurePrivateSqlitePath } from './private-sqlite-path.mjs'
 
 config()   // load .env
+process.umask(0o077)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(__dirname, '..')
@@ -50,14 +52,11 @@ console.log(`[db-setup] Copied ${path.relative(root, src)} → prisma/schema.pri
 if (engine === 'sqlite') {
     const raw = process.env.DATABASE_FILE_PATH || '~/.ippon/database.sqlite'
     const expanded = raw.replace(/^~/, os.homedir())
-    const absolute = path.resolve(expanded)
-
-    // Ensure parent directory exists
-    const dir = path.dirname(absolute)
-    if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true })
-        console.log(`[db-setup] Created directory: ${dir}`)
-    }
+    const absolute = ensurePrivateSqlitePath(expanded, {
+        onCreate: (kind, target) => {
+            console.log(`[db-setup] Created private ${kind}: ${target}`)
+        },
+    })
 
     process.env.DATABASE_URL = `file:${absolute}`
     console.log(`[db-setup] DATABASE_URL = file:${absolute}`)
