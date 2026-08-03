@@ -68,6 +68,14 @@ directly; a product embeds it as its wallet engine and supplies the approval UI.
 - A real funded restore drill and an independent security review are still
   required before a production release.
 
+| Surface | Current behavior in this fork |
+|---|---|
+| REST API | The upstream REST behavior remains available and does not use the split approval adapters. |
+| Local CLI ecash send/receive | The inherited one-step `send` and token `receive` commands remain available. |
+| Local CLI Lightning payment | One-step `pay` and raw-ID `pay-check` are disabled; use `pay-prepare`, external approval, `pay-execute`, and `pay-status`. |
+| Local CLI Lightning receive | Unlocked `deposit` and raw-ID `deposit-check` are disabled; use `receive-prepare`, external approval, `receive-execute`, and `receive-status`. |
+| Local SQLite storage | The parent directory must be mode `0700`, the database must be `0600`, and symbolic-link traversal is rejected. |
+
 ### Opt-in local regtest fault drill
 
 The live-protocol drill is intentionally separate from the ordinary unit test
@@ -554,15 +562,18 @@ yarn start:local
 
 ### Testing
 
-The test suite uses [Vitest](https://vitest.dev/) and covers three layers:
+The standard test suite uses [Vitest](https://vitest.dev/) and covers the
+following files without a live mint or funded wallet:
 
 | File | Scope |
 |---|---|
 | `src/__tests__/nostrService.test.ts` | Unit — pubkey normalisation (npub / x-only hex / compressed hex) |
 | `src/__tests__/walletService.test.ts` | Unit — `WalletService` methods with Prisma and cashu-ts mocked |
 | `src/__tests__/splitMeltService.test.ts` | Unit — prepare/execute separation, restart recovery, reconciliation, and failure injection |
+| `src/__tests__/splitMintService.test.ts` | Unit — locked receive preparation, one mint attempt, and NUT-09 recovery |
 | `src/__tests__/publicRoutes.test.ts` | Integration — unauthenticated routes (`GET /v1/info`, `POST /v1/wallet`) |
 | `src/__tests__/protectedRoutes.test.ts` | Integration — all authenticated routes via Fastify `inject()` |
+| `scripts/private-sqlite-path.test.mjs` | Unit — private directory/file modes and symbolic-link rejection |
 
 ```bash
 # Run once
@@ -572,7 +583,10 @@ yarn test
 yarn test:watch
 ```
 
-All external I/O (Prisma, cashu-ts `Wallet`, token encoding, fetch) is mocked; no database or mint connection is required.
+All external I/O in the standard suite (Prisma, cashu-ts `Wallet`, token
+encoding, and fetch) is mocked; no database or mint connection is required.
+The opt-in two-mint fault drill described earlier is the separate live-protocol
+test and uses only loopback FakeWallet mints.
 
 ### MCP server
 
