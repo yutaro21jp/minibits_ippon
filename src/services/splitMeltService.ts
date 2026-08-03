@@ -42,7 +42,16 @@ type ReconciliationEvidence = {
     quote_state: string | null
     proof_states: string[]
     payment_preimage: string | null
+    fee_paid: number | null
+    total_spent: number | null
+    balance_after: number | null
     error_code: string | null
+}
+
+type PaidReceipt = {
+    feePaid: number
+    totalSpent: number
+    balanceAfter: number
 }
 
 type PreparedPayment = ReconciliationEvidence & {
@@ -187,6 +196,7 @@ function publicEvidence(
     quoteState: string | null = operation.lastQuoteState,
     proofStates: string[] = [],
     paymentPreimage: string | null = null,
+    paidReceipt: PaidReceipt | null = null,
 ): ReconciliationEvidence {
     return {
         intent_id: operation.intentId,
@@ -194,6 +204,9 @@ function publicEvidence(
         quote_state: quoteState,
         proof_states: proofStates,
         payment_preimage: paymentPreimage,
+        fee_paid: paidReceipt?.feePaid ?? null,
+        total_spent: paidReceipt?.totalSpent ?? null,
+        balance_after: paidReceipt?.balanceAfter ?? null,
         error_code: operation.errorCode,
     }
 }
@@ -386,7 +399,24 @@ async function reconcile(
             if (change.length === 0 && quote.change && quote.change.length > 0) {
                 change = wallet.createMeltChangeProofs(restoredOutputs(operation), quote.change)
             }
-            const paid = await prisma.$transaction(async tx => {
+            const selectedTotal = sumProofs(proofs)
+            const changeTotal = change.length > 0 ? sumProofs(change) : Amount.zero()
+            const invoiceAmount = Amount.from(operation.amount)
+            const maxFee = Amount.from(operation.feeReserve).add(Amount.from(operation.inputFee))
+            if (changeTotal.greaterThan(selectedTotal)) {
+                fail('INVALID_PAID_RECEIPT', 'Melt change exceeds the selected proof total')
+            }
+            const totalSpentAmount = selectedTotal.subtract(changeTotal)
+            if (totalSpentAmount.lessThan(invoiceAmount)) {
+                fail('INVALID_PAID_RECEIPT', 'Melt total spent is below the invoice amount')
+            }
+            const feePaidAmount = totalSpentAmount.subtract(invoiceAmount)
+            if (feePaidAmount.greaterThan(maxFee)) {
+                fail('INVALID_PAID_RECEIPT', 'Melt fee exceeds the approved maximum')
+            }
+            const feePaid = boundaryNumber(feePaidAmount, 'paid fee')
+            const totalSpent = boundaryNumber(totalSpentAmount, 'total spent')
+            const receipt = await prisma.$transaction(async tx => {
                 await tx.proof.updateMany({
                     where: {
                         walletId: operation.walletId,
@@ -407,7 +437,20 @@ async function reconcile(
                     fail('PROOF_STATE_MISMATCH', 'Local melt proof state does not match the mint')
                 }
                 await saveChangeProofs(tx, operation.walletId, change)
-                return tx.meltOperation.update({
+                const available = await tx.proof.findMany({
+                    where: {
+                        walletId: operation.walletId,
+                        status: ProofStatus.UNSPENT,
+                        reservedByIntentId: null,
+                    },
+                    select: { amount: true },
+                })
+                let balanceAfterAmount = Amount.zero()
+                for (const proof of available) {
+                    balanceAfterAmount = balanceAfterAmount.add(Amount.from(proof.amount))
+                }
+                const balanceAfter = boundaryNumber(balanceAfterAmount, 'balance after payment')
+                const paid = await tx.meltOperation.update({
                     where: { intentId: operation.intentId },
                     data: {
                         state: MeltOperationState.PAID,
@@ -416,10 +459,20 @@ async function reconcile(
                         reconciledAt: new Date(),
                     },
                 })
+                return { paid, balanceAfter }
             })
-            return publicEvidence(paid, quote.state, remoteProofStates, quote.payment_preimage)
-        } catch {
-            const unknown = await setUnknown(operation, 'change_recovery_failed')
+            return publicEvidence(
+                receipt.paid,
+                quote.state,
+                remoteProofStates,
+                quote.payment_preimage,
+                { feePaid, totalSpent, balanceAfter: receipt.balanceAfter },
+            )
+        } catch (error) {
+            const errorCode = error instanceof SplitMeltError && error.code === 'INVALID_PAID_RECEIPT'
+                ? 'invalid_paid_receipt'
+                : 'change_recovery_failed'
+            const unknown = await setUnknown(operation, errorCode)
             return publicEvidence(unknown, quote.state, remoteProofStates)
         }
     }

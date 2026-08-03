@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
     meltOperationUpdateMany: vi.fn(),
     proofUpdateMany: vi.fn(),
     proofCount: vi.fn(),
+    proofFindMany: vi.fn(),
     proofFindUnique: vi.fn(),
     proofCreate: vi.fn(),
     walletFindUniqueOrThrow: vi.fn(),
@@ -65,6 +66,7 @@ vi.mock('../utils/prismaClient', () => ({
         proof: {
             updateMany: mocks.proofUpdateMany,
             count: mocks.proofCount,
+            findMany: mocks.proofFindMany,
             findUnique: mocks.proofFindUnique,
             create: mocks.proofCreate,
         },
@@ -218,6 +220,23 @@ describe('SplitMeltService', () => {
                 || where.reservedByIntentId === reservedByIntentId
             return where.status === proofStatus && reservationMatches ? 1 : 0
         })
+        mocks.proofFindMany.mockImplementation(async ({ where }: any) => {
+            const available = []
+            if (
+                where.status === ProofStatus.UNSPENT
+                && where.reservedByIntentId === null
+                && proofStatus === ProofStatus.UNSPENT
+                && reservedByIntentId === null
+            ) {
+                available.push({ amount: selectedProof.amount.toNumber() })
+            }
+            for (const proof of storedChange.values()) {
+                if (proof.status === ProofStatus.UNSPENT && proof.reservedByIntentId === null) {
+                    available.push({ amount: proof.amount })
+                }
+            }
+            return available
+        })
         mocks.proofFindUnique.mockImplementation(async ({ where }: any) => storedChange.get(where.secret) ?? null)
         mocks.proofStorageData.mockImplementation((walletId: number, proof: any, status: ProofStatus) => ({
             walletId,
@@ -252,6 +271,7 @@ describe('SplitMeltService', () => {
                     proof: {
                         updateMany: mocks.proofUpdateMany,
                         count: mocks.proofCount,
+                        findMany: mocks.proofFindMany,
                         findUnique: mocks.proofFindUnique,
                         create: mocks.proofCreate,
                     },
@@ -380,6 +400,9 @@ describe('SplitMeltService', () => {
             quote_state: MeltQuoteState.PAID,
             proof_states: [CheckStateEnum.SPENT],
             payment_preimage: PAYMENT_PREIMAGE,
+            fee_paid: 7,
+            total_spent: 107,
+            balance_after: 0,
         })
         expect(proofStatus).toBe(ProofStatus.SPENT)
         expect(reservedByIntentId).toBeNull()
@@ -501,7 +524,12 @@ describe('SplitMeltService', () => {
             change: [changeProof],
             outputData: [],
         })
-        await SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared))
+        const paid = await SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared))
+        expect(paid).toMatchObject({
+            fee_paid: 4,
+            total_spent: 104,
+            balance_after: 3,
+        })
         expect(mocks.proofCreate).toHaveBeenCalledTimes(1)
 
         mocks.checkMeltQuoteBolt11.mockResolvedValueOnce({
@@ -510,9 +538,40 @@ describe('SplitMeltService', () => {
         })
         mocks.checkProofsStates.mockResolvedValueOnce([{ state: CheckStateEnum.SPENT }])
         mocks.createMeltChangeProofs.mockReturnValueOnce([changeProof])
-        await SplitMeltService.status(storedWallet, INTENT_ID)
+        const recovered = await SplitMeltService.status(storedWallet, INTENT_ID)
 
         expect(mocks.proofCreate).toHaveBeenCalledTimes(1)
         expect(operation.state).toBe(MeltOperationState.PAID)
+        expect(recovered).toMatchObject({
+            fee_paid: 4,
+            total_spent: 104,
+            balance_after: 3,
+        })
+    })
+
+    it('fails closed when recovered change would make the paid receipt impossible', async () => {
+        const impossibleChange = {
+            id: 'change-keyset',
+            amount: Amount.from(108),
+            secret: 'impossible-change-secret',
+            C: 'impossible-change-C',
+        }
+        const prepared = await SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE)
+        mocks.completeMelt.mockResolvedValueOnce({
+            quote: quote(MeltQuoteState.PAID, PAYMENT_PREIMAGE),
+            change: [impossibleChange],
+            outputData: [],
+        })
+
+        const result = await SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared))
+
+        expect(result).toMatchObject({
+            state: MeltOperationState.UNKNOWN,
+            fee_paid: null,
+            total_spent: null,
+            balance_after: null,
+            error_code: 'invalid_paid_receipt',
+        })
+        expect(proofStatus).toBe(ProofStatus.PENDING)
     })
 })
