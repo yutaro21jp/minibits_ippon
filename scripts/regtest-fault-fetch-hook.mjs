@@ -25,7 +25,11 @@ for (const origin of allowedOrigins) {
         throw new Error('Every regtest origin must be an explicit loopback HTTP origin')
     }
 }
-if (!['observe', 'drop-melt-and-block-reconcile'].includes(mode)) {
+if (![
+    'observe',
+    'drop-melt-and-block-reconcile',
+    'drop-mint-and-block-reconcile',
+].includes(mode)) {
     throw new Error('The requested regtest fault mode is invalid')
 }
 
@@ -62,6 +66,51 @@ globalThis.fetch = async function guardedRegtestFetch(input, init) {
     const method = requestMethod(input, init)
     const state = readState()
     state.network_requests += 1
+
+    if (method === 'POST' && url.origin === faultOrigin && url.pathname === '/v1/mint/bolt11') {
+        state.mint_posts += 1
+        writeState(state)
+
+        const response = await originalFetch(input, init)
+        const latest = readState()
+        latest.mint_http_status = response.status
+        if (
+            mode === 'drop-mint-and-block-reconcile'
+            && !latest.mint_response_dropped
+            && response.ok
+        ) {
+            latest.mint_response_dropped = true
+            writeState(latest)
+            throw new TypeError('Injected loss of an accepted mint response')
+        }
+        writeState(latest)
+        return response
+    }
+
+    if (
+        method === 'GET'
+        && url.origin === faultOrigin
+        && url.pathname.startsWith('/v1/mint/quote/bolt11/')
+    ) {
+        state.mint_quote_checks += 1
+        if (
+            mode === 'drop-mint-and-block-reconcile'
+            && state.mint_response_dropped
+            && !state.first_mint_reconcile_blocked
+        ) {
+            state.first_mint_reconcile_blocked = true
+            writeState(state)
+            throw new TypeError('Injected loss of the first mint quote reconciliation')
+        }
+        writeState(state)
+        return originalFetch(input, init)
+    }
+
+    if (method === 'POST' && url.origin === faultOrigin && url.pathname === '/v1/restore') {
+        state.restore_posts += 1
+        writeState(state)
+        return originalFetch(input, init)
+    }
 
     if (method === 'POST' && url.origin === faultOrigin && url.pathname === '/v1/melt/bolt11') {
         state.melt_posts += 1

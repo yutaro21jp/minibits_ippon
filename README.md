@@ -26,6 +26,13 @@ boundary for systems that must not pay immediately when an invoice arrives:
 4. `pay-status` reconciles PENDING or UNKNOWN outcomes after a timeout or
    restart. It never retries the melt.
 
+Incoming Lightning uses the same split boundary. `receive-prepare` creates a
+NUT-20 quote locked to a fresh secp256k1 key, prepares signed blinded outputs,
+and keeps the quote ID, private key, and output secrets in the Ippon database.
+`receive-status` checks payment state without minting. Once paid,
+`receive-execute` accepts only the approved hashes and submits the mint request
+at most once; an ambiguous issued result is recovered with NUT-09 restore.
+
 This is useful for an AI assistant proposing a small purchase, an expense bot
 waiting for an owner, or any service that wants to avoid blind retries and
 duplicate payments. End users normally do not operate this repository
@@ -35,6 +42,8 @@ directly; a product embeds it as its wallet engine and supplies the approval UI.
 
 - The split payment flow is implemented only for local CLI mode. The REST API
   remains outside this approval adapter.
+- The split receive flow is also local-CLI-only. Unlocked `deposit` and raw
+  `deposit-check` commands are disabled in this fork.
 - cashu-ts is pinned to 4.7.2 and amounts stay native until database, REST, or
   CLI integer boundaries.
 - Quote IDs, proofs, and change-recovery material stay in the private Ippon
@@ -42,11 +51,14 @@ directly; a product embeds it as its wallet engine and supplies the approval UI.
   maximum economic spend is kept separate from the proof total temporarily
   handed to the mint; any excess is covered by persisted NUT-08 change outputs.
 - The full mocked test suite and build pass, including restart, proof
-  reservation, preimage verification, and ambiguous-outcome tests.
+  reservation, preimage verification, locked-quote issuance, NUT-09 restore,
+  and ambiguous-outcome tests.
 - A two-mint local Nutshell FakeWallet drill now covers an accepted melt whose
   response is lost, immediate UNKNOWN persistence, and status-only recovery
   after process restart. It also verifies that cashu-ts cannot silently retry
-  the approved melt through NUT-19 transport caching.
+  the approved melt through NUT-19 transport caching. The same drill drops an
+  accepted NUT-20 mint response, blocks its first reconciliation, and verifies
+  status-only NUT-09 recovery without a second mint request.
 - `restore-audit` checks every proof in a restored private database against the
   mint's NUT-07 state without spending or exporting it. It fails readiness on
   PENDING proofs, local/remote mismatches, active reservations, or unresolved
@@ -71,14 +83,14 @@ npm run test:regtest-fault
 ```
 
 The exact acknowledgement, two loopback-only origins, 25-fake-sat funding cap,
-1-fake-sat payment cap, disposable databases, and secret-free result are
-enforced in the harness. It forwards one accepted melt, discards that response,
-blocks the first reconciliation, restarts Ippon, and permits only `pay-status`
-to recover the operation. The 25-fake-sat source deliberately lacks an exact
-small-denomination proof set, so the drill also verifies persisted change
-recovery. The temporary wallets, proofs, mint keys, and databases are removed
-even on failure; `uv` may retain only its public package and Python download
-cache.
+1-fake-sat payment cap, 2-fake-sat receive cap, disposable databases, and
+secret-free result are enforced in the harness. It drops accepted melt and mint
+responses independently, blocks the first reconciliation for each, and permits
+only status commands to recover the operations. The payment path verifies
+persisted change recovery; the receive path verifies one mint submission,
+NUT-09 output restore, and terminal deletion of private quote material. The
+temporary wallets, proofs, mint keys, and databases are removed even on
+failure; `uv` may retain only its public package and Python download cache.
 
 Nutshell's FakeWallet is adjusted only inside these acknowledged local test
 processes so its synthetic invoice uses standard 32-byte BOLT11 preimage
@@ -376,17 +388,20 @@ All commands are typed at the `> ` prompt (or piped via stdin). Every response i
 
 | Command | Description |
 |---|---|
-| `info` | Service info: mints, unit, global limits, and the split-payment adapter contract |
+| `info` | Service info: mints, unit, global limits, and split payment/receive adapter contracts |
 | `wallet create [name] [mint_url]` | Create a new wallet; mint must be in `MINT_URLS`; prints `access_key` |
 | `wallet list` | List all wallets with balances |
 | `wallet <key> balance` | Show wallet balance and details; auto-syncs pending proofs with the mint first |
-| `wallet <key> deposit <amount>` | Create a Lightning invoice to fund the wallet |
-| `wallet <key> deposit-check <quote_id>` | Check deposit status; auto-mints ecash when paid |
+| `wallet <key> deposit <amount>` | Disabled: unlocked mint quotes are unsafe for remote approval |
+| `wallet <key> deposit-check <quote_id>` | Disabled: raw quote IDs stay inside Ippon |
 | `wallet <key> send <amount> [lock_pubkey]` | Export a Cashu token (optionally P2PK-locked) |
 | `wallet <key> receive <token>` | Import a Cashu token |
 | `wallet <key> pay-prepare <intent_id> <bolt11>` | Create and persist a quote, fixed proof plan, and change recovery data without paying |
 | `wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>` | Execute the approved, unchanged plan once |
 | `wallet <key> pay-status <intent_id>` | Reconcile quote and proof states without retrying the melt |
+| `wallet <key> receive-prepare <intent_id> <amount>` | Create one NUT-20 locked quote and persist its signed output plan |
+| `wallet <key> receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256>` | Mint the approved paid quote at most once |
+| `wallet <key> receive-status <intent_id>` | Reconcile the quote and recover issued outputs without retrying mint |
 | `wallet <key> sync` | Sync pending proofs with the mint |
 | `restore-audit <mint_url>` | Check every proof for one allowlisted mint in a restored DB against NUT-07 without changing wallet state or exposing the access key |
 | `decode <data>` | Decode a Cashu token, Cashu request, or BOLT11 invoice |
@@ -399,11 +414,14 @@ All commands are typed at the `> ` prompt (or piped via stdin). Every response i
 > wallet create agent-session-1
 {"access_key":"adg-08m","name":"agent-session-1","mint":"https://mint.minibits.cash/Bitcoin","unit":"sat","balance":0,"pending_balance":0}
 
-> wallet adg-08m deposit 100
-{"quote":"abc123...","request":"lnbc1000n...","state":"UNPAID","expiry":1234567890}
+> wallet adg-08m receive-prepare wallet_89abcdef0123456789abcdef 100
+{"intent_id":"wallet_89abcdef0123456789abcdef","state":"PREPARED","quote_state":"UNPAID","amount":100,"request":"lnbc1000n...","expiry":1234567890,"invoice_sha256":"...","quote_sha256":"...","output_plan_sha256":"...","proofs_issued":0,"balance":null,"error_code":null}
 
-> wallet adg-08m deposit-check abc123...
-{"quote":"abc123...","request":"lnbc1000n...","state":"PAID","expiry":1234567890}
+> wallet adg-08m receive-status wallet_89abcdef0123456789abcdef
+{"intent_id":"wallet_89abcdef0123456789abcdef","state":"PAID","quote_state":"PAID","amount":100,"request":"lnbc1000n...","expiry":1234567890,"invoice_sha256":"...","quote_sha256":"...","output_plan_sha256":"...","proofs_issued":0,"balance":null,"error_code":null}
+
+> wallet adg-08m receive-execute wallet_89abcdef0123456789abcdef <invoice_sha256> <quote_sha256> <output_plan_sha256>
+{"intent_id":"wallet_89abcdef0123456789abcdef","state":"ISSUED","quote_state":"ISSUED","amount":100,"request":"lnbc1000n...","expiry":1234567890,"invoice_sha256":"...","quote_sha256":"...","output_plan_sha256":"...","proofs_issued":2,"balance":100,"error_code":null}
 
 > wallet adg-08m balance
 {"access_key":"adg-08m","name":"agent-session-1","mint":"https://mint.minibits.cash/Bitcoin","unit":"sat","balance":100,"pending_balance":0}

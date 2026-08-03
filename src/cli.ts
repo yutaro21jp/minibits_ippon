@@ -2,7 +2,6 @@ import 'dotenv/config'
 import readline from 'readline'
 import crypto from 'crypto'
 import {
-    MintQuoteState,
     getTokenMetadata,
     getEncodedToken,
     decodePaymentRequest,
@@ -11,6 +10,7 @@ import { decode as bolt11Decode } from '@gandlaf21/bolt11-decode'
 import prisma from './utils/prismaClient'
 import { WalletService } from './services/walletService'
 import { SplitMeltError, SplitMeltService } from './services/splitMeltService'
+import { SplitMintError, SplitMintService } from './services/splitMintService'
 import { NostrService } from './services/nostrService'
 import { log } from './services/logService'
 
@@ -58,8 +58,9 @@ async function handleCommand(parts: string[]): Promise<void> {
                 'wallet create [name] [mint_url]',
                 'wallet list',
                 'wallet <key> balance',
-                'wallet <key> deposit <amount>',
-                'wallet <key> deposit-check <quote_id>',
+                'wallet <key> receive-prepare <intent_id> <amount>',
+                'wallet <key> receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256>',
+                'wallet <key> receive-status <intent_id>',
                 'wallet <key> send <amount> [lock_pubkey]',
                 'wallet <key> receive <token>',
                 'wallet <key> pay-prepare <intent_id> <bolt11>',
@@ -92,6 +93,16 @@ async function handleCommand(parts: string[]): Promise<void> {
                 proof_state_reconciliation: true,
                 preimage_verification: true,
                 full_proof_restore_audit: true,
+            },
+            receive_adapter: {
+                protocol_version: 1,
+                cashu_ts_version: '4.7.2',
+                nut20_locked_quotes: true,
+                unique_quote_keys: true,
+                persistent_operations: true,
+                split_mint: true,
+                issued_output_restore: true,
+                single_mint_attempt: true,
             },
         })
         return
@@ -256,33 +267,73 @@ async function handleCommand(parts: string[]): Promise<void> {
             return
         }
 
-        // deposit <amount>
+        // The old deposit path creates an unlocked quote and is unsafe for
+        // a remote approval-gated wallet.
         if (op === 'deposit') {
-            const amount = parseInt(parts[3])
-            if (!amount || amount <= 0) { cliError('Usage: wallet <key> deposit <amount>'); return }
-            try {
-                const quote = await WalletService.createMintQuote(amount, wallet.mint)
-                out({ quote: quote.quote, request: quote.request, state: quote.state, expiry: quote.expiry })
-            } catch (e: any) { cliError(e.message) }
+            cliError(
+                'Unlocked deposit is disabled; use receive-prepare and an intent ID',
+                'UNSAFE_OPERATION',
+            )
             return
         }
 
-        // deposit-check <quote_id>
+        // Raw quote IDs never cross the private Ippon CLI boundary.
         if (op === 'deposit-check') {
-            const quoteId = parts[3]
-            if (!quoteId) { cliError('Usage: wallet <key> deposit-check <quote_id>'); return }
+            cliError('Raw quote lookup is disabled; use receive-status with an intent ID', 'UNSAFE_OPERATION')
+            return
+        }
+
+        // receive-prepare <intent_id> <amount>
+        if (op === 'receive-prepare') {
+            const intentId = parts[3]
+            const amountText = parts[4]
+            const amount = amountText && /^\d+$/.test(amountText) ? Number(amountText) : 0
+            if (!intentId || !Number.isSafeInteger(amount) || amount <= 0) {
+                cliError('Usage: wallet <key> receive-prepare <intent_id> <amount>', 'VALIDATION_ERROR')
+                return
+            }
             try {
-                const quote = await WalletService.checkMintQuote(quoteId, wallet.mint)
-                if (quote.state === MintQuoteState.PAID) {
-                    try {
-                        const proofs = await WalletService.mintProofs(quote.amount, quote.quote, wallet.mint)
-                        await WalletService.saveProofs(wallet.id, proofs)
-                    } catch (e: any) {
-                        log.warn('[CLI deposit-check] mint proofs failed', { error: e.message })
-                    }
-                }
-                out({ quote: quote.quote, request: quote.request, state: quote.state, expiry: quote.expiry })
-            } catch (e: any) { cliError(e.message) }
+                out(await SplitMintService.prepare(wallet, intentId, amount))
+            } catch (e: any) {
+                cliError(e.message, e instanceof SplitMintError ? e.code : 'RECEIVE_PREPARE_ERROR')
+            }
+            return
+        }
+
+        // receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256>
+        if (op === 'receive-execute') {
+            const [intentId, invoiceSha256, quoteSha256, outputPlanSha256] = parts.slice(3, 7)
+            if (!intentId || !invoiceSha256 || !quoteSha256 || !outputPlanSha256) {
+                cliError(
+                    'Usage: wallet <key> receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256>',
+                    'VALIDATION_ERROR',
+                )
+                return
+            }
+            try {
+                out(await SplitMintService.execute(wallet, intentId, {
+                    invoiceSha256,
+                    quoteSha256,
+                    outputPlanSha256,
+                }))
+            } catch (e: any) {
+                cliError(e.message, e instanceof SplitMintError ? e.code : 'RECEIVE_EXECUTE_ERROR')
+            }
+            return
+        }
+
+        // receive-status <intent_id>
+        if (op === 'receive-status') {
+            const intentId = parts[3]
+            if (!intentId) {
+                cliError('Usage: wallet <key> receive-status <intent_id>', 'VALIDATION_ERROR')
+                return
+            }
+            try {
+                out(await SplitMintService.status(wallet, intentId))
+            } catch (e: any) {
+                cliError(e.message, e instanceof SplitMintError ? e.code : 'RECEIVE_STATUS_ERROR')
+            }
             return
         }
 

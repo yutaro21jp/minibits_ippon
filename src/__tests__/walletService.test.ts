@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
     prismaProofCreate: vi.fn(),
     prismaProofUpdateMany: vi.fn(),
     prismaMeltOperationCount: vi.fn(),
+    prismaMintOperationCount: vi.fn(),
 }))
 
 // ── mocks ─────────────────────────────────────────────────────────────────────
@@ -59,6 +60,7 @@ vi.mock('../utils/prismaClient', () => ({
         },
         wallet: { create: vi.fn(), findUnique: vi.fn() },
         meltOperation: { count: mocks.prismaMeltOperationCount },
+        mintOperation: { count: mocks.prismaMintOperationCount },
     },
 }))
 
@@ -208,6 +210,7 @@ describe('WalletService.auditRestoredProofs', () => {
         vi.clearAllMocks()
         mocks.walletLoadMint.mockResolvedValue(undefined)
         mocks.prismaMeltOperationCount.mockResolvedValue(0)
+        mocks.prismaMintOperationCount.mockResolvedValue(0)
     })
 
     it('checks every restored proof and reports a funded wallet ready without changing state', async () => {
@@ -244,7 +247,7 @@ describe('WalletService.auditRestoredProofs', () => {
         expect(mocks.prismaProofUpdateMany).not.toHaveBeenCalled()
     })
 
-    it('fails funded readiness on a mismatch, pending proof, reservation, or unresolved melt', async () => {
+    it('fails funded readiness on a mismatch, pending proof, reservation, or unresolved operation', async () => {
         mocks.prismaProofFindMany.mockResolvedValue([
             makeDbProof('mismatch', 21),
             {
@@ -259,6 +262,7 @@ describe('WalletService.auditRestoredProofs', () => {
             { state: CheckStateEnum.PENDING },
         ])
         mocks.prismaMeltOperationCount.mockResolvedValue(1)
+        mocks.prismaMintOperationCount.mockResolvedValue(1)
 
         const result = await WalletService.auditRestoredProofs(
             1,
@@ -271,7 +275,7 @@ describe('WalletService.auditRestoredProofs', () => {
             recoverable_balance: 0,
             state_mismatches: 1,
             reserved_proofs: 1,
-            unresolved_operations: 1,
+            unresolved_operations: 2,
             funded_restore_ready: false,
         })
         expect(mocks.prismaProofUpdateMany).not.toHaveBeenCalled()

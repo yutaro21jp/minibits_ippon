@@ -16,7 +16,7 @@ import {
     setGlobalRequestOptions,
     sumProofs,
 } from '@cashu/cashu-ts'
-import { MeltOperationState, ProofStatus } from '@prisma/client'
+import { MeltOperationState, MintOperationState, ProofStatus } from '@prisma/client'
 import prisma from '../utils/prismaClient'
 import AppError, { Err } from '../utils/AppError'
 import { log } from './logService'
@@ -217,7 +217,7 @@ const auditRestoredProofs = async function (walletId: number, mintUrl: string): 
     }
 
     const reservedProofs = stored.filter(proof => proof.reservedByIntentId !== null).length
-    const unresolvedOperations = await prisma.meltOperation.count({
+    const unresolvedMeltOperations = await prisma.meltOperation.count({
         where: {
             walletId,
             state: {
@@ -230,6 +230,21 @@ const auditRestoredProofs = async function (walletId: number, mintUrl: string): 
             },
         },
     })
+    const unresolvedMintOperations = await prisma.mintOperation.count({
+        where: {
+            walletId,
+            state: {
+                in: [
+                    MintOperationState.CREATING,
+                    MintOperationState.PREPARED,
+                    MintOperationState.PAID,
+                    MintOperationState.EXECUTING,
+                    MintOperationState.UNKNOWN,
+                ],
+            },
+        },
+    })
+    const unresolvedOperations = unresolvedMeltOperations + unresolvedMintOperations
     const allProofsChecked = remoteStates.length === stored.length
     const fundedRestoreReady = allProofsChecked
         && stored.length > 0

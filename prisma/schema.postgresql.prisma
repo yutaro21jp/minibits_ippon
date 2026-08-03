@@ -20,6 +20,7 @@ model Wallet {
   updatedAt      DateTime?
   proofs         Proof[]
   meltOperations MeltOperation[]
+  mintOperations MintOperation[]
 }
 
 enum ProofStatus {
@@ -35,6 +36,16 @@ enum MeltOperationState {
   UNKNOWN
   PAID
   UNPAID
+  EXPIRED
+}
+
+enum MintOperationState {
+  CREATING
+  PREPARED
+  PAID
+  EXECUTING
+  UNKNOWN
+  ISSUED
   EXPIRED
 }
 
@@ -80,6 +91,37 @@ model MeltOperation {
   executedAt         DateTime?
   reconciledAt       DateTime?
   reservedProofs     Proof[]            @relation("ReservedMeltProofs")
+
+  @@index([walletId, state])
+}
+
+model MintOperation {
+  intentId         String             @id
+  walletId         Int
+  wallet           Wallet             @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  quoteId          String?            @unique
+  request          String?
+  amount           Int
+  expiry           BigInt?
+  quotePrivkey     String?
+  quotePubkey      String
+  keysetId         String?
+  outputDataJson   String?
+  signature        String?
+  legacySignature  String?
+  invoiceSha256    String?
+  quoteSha256      String?
+  outputPlanSha256 String?
+  state            MintOperationState @default(CREATING)
+  executionCount   Int                @default(0)
+  proofsIssued     Int                @default(0)
+  balanceAfter     Int?
+  lastQuoteState   String?
+  errorCode        String?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  executedAt       DateTime?
+  reconciledAt     DateTime?
 
   @@index([walletId, state])
 }

@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 const ACKNOWLEDGEMENT = 'local-regtest-fake-ecash-only'
 const FUNDING_FAKE_SATS = 25
 const PAYMENT_FAKE_SATS = 1
+const RECEIVE_FAKE_SATS = 2
 const PROCESS_TIMEOUT_MS = 45_000
 const MAX_STATUS_ATTEMPTS = 15
 
@@ -225,6 +226,7 @@ async function startLocalNutshell(
             requireCondition(/^Nutshell\//.test(info?.version || ''), 'local_nutshell_identity_changed')
             requireCondition(info?.nuts?.['4']?.disabled === false, 'local_nutshell_minting_disabled')
             requireCondition(Array.isArray(info?.nuts?.['5']?.methods), 'local_nutshell_melting_unavailable')
+            requireCondition(info?.nuts?.['20']?.supported === true, 'local_nutshell_nut20_unavailable')
             return { child, origin }
         }
         await delay(500)
@@ -269,26 +271,34 @@ async function fundDisposableWallet(context) {
     )
     requireCondition(typeof created.access_key === 'string', 'source_wallet_key_missing')
 
-    const deposit = await runCliSuccess(
-        `wallet ${created.access_key} deposit ${FUNDING_FAKE_SATS}`,
-        { ...context, label: 'source_deposit_quote' },
+    const intentId = `wallet_${crypto.randomBytes(12).toString('hex')}`
+    const prepared = await runCliSuccess(
+        `wallet ${created.access_key} receive-prepare ${intentId} ${FUNDING_FAKE_SATS}`,
+        { ...context, label: 'source_locked_funding_quote' },
     )
-    requireCondition(typeof deposit.quote === 'string', 'source_deposit_quote_missing')
-    requireCondition(typeof deposit.request === 'string', 'source_deposit_invoice_missing')
+    requireCondition(typeof prepared.request === 'string', 'source_funding_invoice_missing')
 
+    let lastStatus
     for (let attempt = 0; attempt < 10; attempt += 1) {
-        await runCliSuccess(
-            `wallet ${created.access_key} deposit-check ${deposit.quote}`,
-            { ...context, label: 'source_deposit_check' },
+        const status = await runCliSuccess(
+            `wallet ${created.access_key} receive-status ${intentId}`,
+            { ...context, label: 'source_funding_status' },
         )
-        const balance = await runCliSuccess(
-            `wallet ${created.access_key} balance`,
-            { ...context, label: 'source_balance_check' },
-        )
-        if (balance.balance === FUNDING_FAKE_SATS) return created.access_key
+        lastStatus = status
+        if (status.state === 'PAID') {
+            const issued = await runCliSuccess(
+                `wallet ${created.access_key} receive-execute ${intentId} ${prepared.invoice_sha256} ${prepared.quote_sha256} ${prepared.output_plan_sha256}`,
+                { ...context, label: 'source_locked_funding_mint' },
+            )
+            requireCondition(issued.state === 'ISSUED', 'source_fake_funding_not_issued')
+            requireCondition(issued.balance === FUNDING_FAKE_SATS, 'source_fake_funding_balance_mismatch')
+            return created.access_key
+        }
         await delay(500)
     }
-    throw new SafeFailure('source_fake_funding_not_minted')
+    throw new SafeFailure(
+        `source_fake_funding_${lastStatus?.state || 'missing'}_${lastStatus?.quote_state || 'none'}_${lastStatus?.error_code || 'none'}`,
+    )
 }
 
 async function createPaymentInvoice(context, destinationOrigin) {
@@ -297,13 +307,14 @@ async function createPaymentInvoice(context, destinationOrigin) {
         { ...context, label: 'destination_wallet_create' },
     )
     requireCondition(typeof destination.access_key === 'string', 'destination_wallet_key_missing')
-    const deposit = await runCliSuccess(
-        `wallet ${destination.access_key} deposit ${PAYMENT_FAKE_SATS}`,
-        { ...context, label: 'destination_invoice_create' },
+    const intentId = `wallet_${crypto.randomBytes(12).toString('hex')}`
+    const prepared = await runCliSuccess(
+        `wallet ${destination.access_key} receive-prepare ${intentId} ${PAYMENT_FAKE_SATS}`,
+        { ...context, label: 'destination_locked_invoice_create' },
     )
-    requireCondition(typeof deposit.request === 'string', 'destination_invoice_missing')
-    requireCondition(deposit.request.toLowerCase().startsWith('lnbc'), 'destination_invoice_not_mainnet_bolt11')
-    return deposit.request
+    requireCondition(typeof prepared.request === 'string', 'destination_invoice_missing')
+    requireCondition(prepared.request.toLowerCase().startsWith('lnbc'), 'destination_invoice_not_mainnet_bolt11')
+    return prepared.request
 }
 
 function changedHash(hash) {
@@ -321,6 +332,7 @@ async function main() {
     )
     requireCondition(FUNDING_FAKE_SATS <= 25, 'fake_funding_limit_exceeded')
     requireCondition(PAYMENT_FAKE_SATS <= 1, 'fake_payment_limit_exceeded')
+    requireCondition(RECEIVE_FAKE_SATS <= 2, 'fake_receive_limit_exceeded')
     await access(appPath)
     await access(hookPath)
     await access(pythonHookPath)
@@ -343,12 +355,18 @@ async function main() {
             network_requests: 0,
             melt_posts: 0,
             melt_quote_checks: 0,
+            mint_posts: 0,
+            mint_quote_checks: 0,
+            restore_posts: 0,
             proof_state_checks: 0,
             other_requests: 0,
             melt_response_dropped: false,
             first_reconcile_blocked: false,
             melt_http_status: null,
             melt_error_code: null,
+            mint_response_dropped: false,
+            first_mint_reconcile_blocked: false,
+            mint_http_status: null,
         })}\n`, { mode: 0o600 })
         // Prisma's schema engine checks SQLite connectivity before `db push`;
         // create the private empty file first so that check remains local and
@@ -484,6 +502,149 @@ async function main() {
             'database_integrity_check_failed',
         )
 
+        const balanceBeforeReceive = await runCliSuccess(
+            `wallet ${sourceAccessKey} balance`,
+            { ...context, label: 'receive_balance_before' },
+        )
+        const receiveIntentId = `wallet_${crypto.randomBytes(12).toString('hex')}`
+        const receivePrepared = await runCliSuccess(
+            `wallet ${sourceAccessKey} receive-prepare ${receiveIntentId} ${RECEIVE_FAKE_SATS}`,
+            { ...context, label: 'locked_receive_prepare' },
+        )
+        requireCondition(receivePrepared.state === 'PREPARED', 'receive_not_prepared')
+        requireCondition(receivePrepared.quote_state === 'UNPAID', 'receive_quote_not_unpaid')
+        requireCondition(receivePrepared.amount === RECEIVE_FAKE_SATS, 'receive_amount_mismatch')
+        requireCondition(
+            typeof receivePrepared.request === 'string'
+            && receivePrepared.request.toLowerCase().startsWith('lnbc'),
+            'receive_invoice_invalid',
+        )
+        for (const field of ['invoice_sha256', 'quote_sha256', 'output_plan_sha256']) {
+            requireCondition(
+                /^[0-9a-f]{64}$/.test(receivePrepared[field]),
+                `receive_${field}_invalid`,
+            )
+        }
+        requireCondition(
+            !Object.hasOwn(receivePrepared, 'quote')
+            && !Object.hasOwn(receivePrepared, 'quotePrivkey')
+            && !Object.hasOwn(receivePrepared, 'outputDataJson'),
+            'receive_prepare_exposed_private_material',
+        )
+        const receivePrivatePlan = await prisma.mintOperation.findUnique({
+            where: { intentId: receiveIntentId },
+        })
+        requireCondition(
+            /^[0-9a-f]{64}$/.test(receivePrivatePlan?.quotePrivkey || ''),
+            'receive_private_quote_key_missing',
+        )
+        requireCondition(
+            /^(02|03)[0-9a-f]{64}$/.test(receivePrivatePlan?.quotePubkey || ''),
+            'receive_quote_pubkey_invalid',
+        )
+        requireCondition(
+            typeof receivePrivatePlan?.signature === 'string'
+            && typeof receivePrivatePlan?.outputDataJson === 'string',
+            'receive_signed_output_plan_missing',
+        )
+
+        let receivePaid
+        let lastReceiveStatus
+        for (let attempt = 0; attempt < MAX_STATUS_ATTEMPTS; attempt += 1) {
+            const status = await runCliSuccess(
+                `wallet ${sourceAccessKey} receive-status ${receiveIntentId}`,
+                { ...context, label: 'receive_wait_for_paid' },
+            )
+            lastReceiveStatus = status
+            if (status.state === 'PAID') {
+                receivePaid = status
+                break
+            }
+            await delay(750)
+        }
+        requireCondition(
+            receivePaid?.state === 'PAID',
+            `receive_not_paid_${lastReceiveStatus?.state || 'missing'}_${lastReceiveStatus?.error_code || 'none'}`,
+        )
+
+        faultState = await readFaultState(faultStatePath)
+        const mintPostsBeforeExecute = faultState.mint_posts
+        const tamperedReceive = await runCli(
+            `wallet ${sourceAccessKey} receive-execute ${receiveIntentId} ${changedHash(receivePrepared.invoice_sha256)} ${receivePrepared.quote_sha256} ${receivePrepared.output_plan_sha256}`,
+            { ...context, label: 'tampered_receive_approval' },
+        )
+        requireCondition(tamperedReceive?.error === true, 'tampered_receive_was_accepted')
+        requireCondition(
+            tamperedReceive.code === 'APPROVAL_HASH_MISMATCH',
+            'tampered_receive_wrong_error',
+        )
+        faultState = await readFaultState(faultStatePath)
+        requireCondition(
+            faultState.mint_posts === mintPostsBeforeExecute,
+            'tampered_receive_reached_mint_endpoint',
+        )
+
+        const unknownReceive = await runCliSuccess(
+            `wallet ${sourceAccessKey} receive-execute ${receiveIntentId} ${receivePrepared.invoice_sha256} ${receivePrepared.quote_sha256} ${receivePrepared.output_plan_sha256}`,
+            { ...context, label: 'lost_mint_response_execute' },
+            'drop-mint-and-block-reconcile',
+        )
+        faultState = await readFaultState(faultStatePath)
+        requireCondition(
+            unknownReceive.state === 'UNKNOWN',
+            `lost_mint_response_${unknownReceive.state || 'missing'}_${unknownReceive.error_code || 'none'}_posts_${faultState.mint_posts}_dropped_${faultState.mint_response_dropped}_blocked_${faultState.first_mint_reconcile_blocked}`,
+        )
+        requireCondition(
+            unknownReceive.error_code === 'reconciliation_unavailable',
+            'lost_mint_response_reason_mismatch',
+        )
+        requireCondition(
+            faultState.mint_posts === mintPostsBeforeExecute + 1,
+            'mint_post_count_after_execute_mismatch',
+        )
+        requireCondition(faultState.mint_response_dropped === true, 'mint_response_was_not_dropped')
+        requireCondition(
+            faultState.first_mint_reconcile_blocked === true,
+            'first_mint_reconcile_was_not_blocked',
+        )
+
+        let receiveIssued
+        for (let attempt = 0; attempt < MAX_STATUS_ATTEMPTS; attempt += 1) {
+            const status = await runCliSuccess(
+                `wallet ${sourceAccessKey} receive-status ${receiveIntentId}`,
+                { ...context, label: 'restart_receive_restore' },
+            )
+            lastReceiveStatus = status
+            if (status.state === 'ISSUED') {
+                receiveIssued = status
+                break
+            }
+            await delay(750)
+        }
+        requireCondition(
+            receiveIssued?.state === 'ISSUED',
+            `receive_restore_state_${lastReceiveStatus?.state || 'missing'}_${lastReceiveStatus?.error_code || 'none'}`,
+        )
+        requireCondition(receiveIssued.proofs_issued > 0, 'receive_issued_proofs_missing')
+        requireCondition(
+            receiveIssued.balance === balanceBeforeReceive.balance + RECEIVE_FAKE_SATS,
+            'receive_balance_after_mismatch',
+        )
+        const receiveOperation = await prisma.mintOperation.findUnique({
+            where: { intentId: receiveIntentId },
+        })
+        requireCondition(receiveOperation?.state === 'ISSUED', 'database_receive_not_issued')
+        requireCondition(receiveOperation.executionCount === 1, 'receive_execution_count_mismatch')
+        requireCondition(receiveOperation.quotePrivkey === null, 'terminal_receive_key_not_cleared')
+        requireCondition(receiveOperation.outputDataJson === null, 'terminal_receive_outputs_not_cleared')
+        requireCondition(receiveOperation.signature === null, 'terminal_receive_signature_not_cleared')
+        faultState = await readFaultState(faultStatePath)
+        requireCondition(
+            faultState.mint_posts === mintPostsBeforeExecute + 1,
+            'mint_was_retried_after_restart',
+        )
+        requireCondition(faultState.restore_posts > 0, 'nut09_restore_was_not_used')
+
         const sourceAudit = await runCliSuccess(
             `restore-audit ${sourceMint.origin}`,
             { ...context, label: 'source_full_proof_audit' },
@@ -522,6 +683,7 @@ async function main() {
             fake_sats: {
                 funded: FUNDING_FAKE_SATS,
                 payment: PAYMENT_FAKE_SATS,
+                receive: RECEIVE_FAKE_SATS,
             },
             fault_injection: {
                 accepted_melt_response_dropped: true,
@@ -539,7 +701,19 @@ async function main() {
                 preimage_verified: true,
                 sqlite_integrity: 'ok',
             },
+            locked_receive_recovery: {
+                method: 'receive-status-with-nut09-restore',
+                terminal_state: receiveIssued.state,
+                execution_count: receiveOperation.executionCount,
+                proofs_issued: receiveIssued.proofs_issued,
+                accepted_mint_response_dropped: faultState.mint_response_dropped,
+                first_reconciliation_blocked: faultState.first_mint_reconcile_blocked,
+                mint_posts: faultState.mint_posts - mintPostsBeforeExecute,
+                restore_posts: faultState.restore_posts,
+                terminal_private_material_cleared: true,
+            },
             approval_tamper_rejected_before_melt: true,
+            receive_approval_tamper_rejected_before_mint: true,
             change_bearing_proof_plan: {
                 maximum_spend: prepared.max_spend,
                 proof_input_total: prepared.proof_input_total,
