@@ -90,7 +90,7 @@ IPPON_NUTSHELL_PATH=/absolute/path/to/nutshell \
 npm run test:regtest-fault
 ```
 
-The exact acknowledgement, two loopback-only origins, 25-fake-sat funding cap,
+The exact acknowledgement, loopback-only origins, 25-fake-sat funding cap,
 1-fake-sat payment cap, 2-fake-sat receive cap, disposable databases, and
 secret-free result are enforced in the harness. It drops accepted melt and mint
 responses independently, blocks the first reconciliation for each, and permits
@@ -103,6 +103,27 @@ failure; `uv` may retain only its public package and Python download cache.
 Nutshell's FakeWallet is adjusted only inside these acknowledged local test
 processes so its synthetic invoice uses standard 32-byte BOLT11 preimage
 hashing. That test-only hook is never loaded by Ippon or a production mint.
+
+The same scenario can be run against a disposable PostgreSQL 17 database when
+Docker or a compatible local engine is available:
+
+```bash
+IPPON_REGTEST_FAULT_ACK=local-regtest-fake-ecash-only \
+IPPON_REGTEST_POSTGRES_ACK=local-disposable-postgresql-only \
+IPPON_NUTSHELL_PATH=/absolute/path/to/nutshell \
+npm run test:regtest-postgresql-fault
+```
+
+The PostgreSQL wrapper uses a digest-pinned official image, a random password,
+two fixed-purpose databases on one `127.0.0.1`-only port, and a tmpfs data
+directory. The container runs as `postgres` with all Linux capabilities
+dropped, `no-new-privileges`, 512 MiB memory, and 0.5 CPU, then is verified
+absent after the drill. In addition to the response-loss checks above, this
+variant starts two independent CLI processes for the same payment and receive,
+requires one database execution and one upstream melt or mint POST, performs a
+custom-format `pg_dump`/`pg_restore` into the second database, and requires the
+restored full-proof audit to match exactly. It never accepts a remote database
+URL or a non-loopback hostname.
 
 ## Open-source maintenance
 

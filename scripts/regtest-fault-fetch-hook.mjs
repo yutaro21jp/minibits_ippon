@@ -1,22 +1,26 @@
-import { readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 
 const ACKNOWLEDGEMENT = 'local-regtest-fake-ecash-only'
 const allowedOriginList = process.env.IPPON_REGTEST_ALLOWED_ORIGINS
 const faultOrigin = process.env.IPPON_REGTEST_FAULT_ORIGIN
 const statePath = process.env.IPPON_REGTEST_FAULT_STATE_PATH
+const requestLogPath = process.env.IPPON_REGTEST_REQUEST_LOG_PATH
 const mode = process.env.IPPON_REGTEST_FAULT_MODE || 'observe'
 
 if (process.env.IPPON_REGTEST_FAULT_ACK !== ACKNOWLEDGEMENT) {
     throw new Error('The local regtest fake-ecash acknowledgement is required')
 }
-if (!statePath) {
-    throw new Error('The regtest fault state path is required')
+if (!statePath || !requestLogPath) {
+    throw new Error('The regtest fault state and request log paths are required')
 }
 if (!allowedOriginList || !faultOrigin) {
     throw new Error('The local regtest origins are required')
 }
 const allowedOrigins = new Set(allowedOriginList.split(',').filter(Boolean))
-if (allowedOrigins.size !== 2 || !allowedOrigins.has(faultOrigin)) {
+if (
+    (allowedOrigins.size !== 2 && allowedOrigins.size !== 3)
+    || !allowedOrigins.has(faultOrigin)
+) {
     throw new Error('The source and destination regtest origins are invalid')
 }
 for (const origin of allowedOrigins) {
@@ -45,6 +49,10 @@ function writeState(state) {
     renameSync(temporaryPath, statePath)
 }
 
+function logRequest(kind) {
+    appendFileSync(requestLogPath, `${kind}\n`, { mode: 0o600 })
+}
+
 function requestUrl(input) {
     if (typeof input === 'string') return new URL(input)
     if (input instanceof URL) return input
@@ -68,6 +76,7 @@ globalThis.fetch = async function guardedRegtestFetch(input, init) {
     state.network_requests += 1
 
     if (method === 'POST' && url.origin === faultOrigin && url.pathname === '/v1/mint/bolt11') {
+        logRequest('mint')
         state.mint_posts += 1
         writeState(state)
 
@@ -113,6 +122,7 @@ globalThis.fetch = async function guardedRegtestFetch(input, init) {
     }
 
     if (method === 'POST' && url.origin === faultOrigin && url.pathname === '/v1/melt/bolt11') {
+        logRequest('melt')
         state.melt_posts += 1
         writeState(state)
 

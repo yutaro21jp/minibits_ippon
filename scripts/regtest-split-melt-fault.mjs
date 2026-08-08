@@ -14,13 +14,16 @@ const PAYMENT_FAKE_SATS = 1
 const RECEIVE_FAKE_SATS = 2
 const PROCESS_TIMEOUT_MS = 45_000
 const MAX_STATUS_ATTEMPTS = 15
+const DATABASE_ENGINE = (process.env.IPPON_REGTEST_DATABASE_ENGINE || 'sqlite').toLowerCase()
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const appPath = path.join(root, 'dist', 'index.js')
 const hookPath = path.join(root, 'scripts', 'regtest-fault-fetch-hook.mjs')
 const pythonHookPath = path.join(root, 'scripts', 'regtest-python')
 const prismaCliPath = path.join(root, 'node_modules', 'prisma', 'build', 'index.js')
-const schemaPath = path.join(root, 'prisma', 'schema.sqlite.prisma')
+const sqliteSchemaPath = path.join(root, 'prisma', 'schema.sqlite.prisma')
+const postgresqlSchemaPath = path.join(root, 'prisma', 'schema.postgresql.prisma')
+const schemaPath = DATABASE_ENGINE === 'postgresql' ? postgresqlSchemaPath : sqliteSchemaPath
 
 class SafeFailure extends Error {
     constructor(code) {
@@ -91,14 +94,14 @@ function lastJsonLine(stdout, label) {
     return values.at(-1)
 }
 
-function cliEnvironment(databasePath, faultStatePath, mode) {
+function cliEnvironment(context, mode) {
     const existingNodeOptions = process.env.NODE_OPTIONS?.trim()
     const importHook = `--import=${hookPath}`
     return {
         ...process.env,
-        DATABASE_ENGINE: 'sqlite',
-        DATABASE_FILE_PATH: databasePath,
-        DATABASE_URL: `file:${databasePath}`,
+        DATABASE_ENGINE,
+        DATABASE_FILE_PATH: context.databasePath || '',
+        DATABASE_URL: context.databaseUrl,
         INTERACTION_MODE: 'cli',
         MINT_URLS: process.env.IPPON_REGTEST_ALLOWED_ORIGINS,
         UNIT: 'sat',
@@ -107,7 +110,8 @@ function cliEnvironment(databasePath, faultStatePath, mode) {
         MAX_PAY: '32',
         LOG_LEVEL: 'error',
         IPPON_REGTEST_FAULT_ACK: ACKNOWLEDGEMENT,
-        IPPON_REGTEST_FAULT_STATE_PATH: faultStatePath,
+        IPPON_REGTEST_FAULT_STATE_PATH: context.faultStatePath,
+        IPPON_REGTEST_REQUEST_LOG_PATH: context.requestLogPath,
         IPPON_REGTEST_FAULT_MODE: mode,
         IPPON_REGTEST_ALLOWED_ORIGINS: process.env.IPPON_REGTEST_ALLOWED_ORIGINS,
         IPPON_REGTEST_FAULT_ORIGIN: process.env.IPPON_REGTEST_FAULT_ORIGIN,
@@ -117,7 +121,7 @@ function cliEnvironment(databasePath, faultStatePath, mode) {
 
 async function runCli(command, context, mode = 'observe') {
     const result = await runProcess(process.execPath, [appPath], {
-        env: cliEnvironment(context.databasePath, context.faultStatePath, mode),
+        env: cliEnvironment(context, mode),
         input: `${command}\nexit\n`,
         label: context.label,
     })
@@ -134,7 +138,7 @@ async function runCliSuccess(command, context, mode = 'observe') {
 async function reserveLoopbackPort() {
     const server = net.createServer()
     await new Promise((resolve, reject) => {
-        server.once('error', reject)
+        server.once('error', () => reject(new SafeFailure('regtest_port_unavailable')))
         server.listen(0, '127.0.0.1', resolve)
     })
     const address = server.address()
@@ -249,7 +253,20 @@ async function stopProcess(child) {
     }
 }
 
-async function setupDatabase(databasePath) {
+async function generatePrismaClient(targetSchemaPath, label) {
+    const result = await runProcess(process.execPath, [
+        prismaCliPath,
+        'generate',
+        '--schema',
+        targetSchemaPath,
+    ], {
+        env: process.env,
+        label,
+    })
+    requireCondition(result.code === 0, `${label}_failed`)
+}
+
+async function setupDatabase(context) {
     const result = await runProcess(process.execPath, [
         prismaCliPath,
         'db',
@@ -258,10 +275,101 @@ async function setupDatabase(databasePath) {
         schemaPath,
         '--skip-generate',
     ], {
-        env: { ...process.env, DATABASE_URL: `file:${databasePath}` },
+        env: { ...process.env, DATABASE_URL: context.databaseUrl },
         label: 'database_setup',
     })
     requireCondition(result.code === 0, 'database_setup_failed')
+}
+
+function validatedPostgresqlUrl(raw, expectedDatabase, label) {
+    let url
+    try {
+        url = new URL(raw)
+    } catch {
+        throw new SafeFailure(`${label}_invalid`)
+    }
+    requireCondition(
+        url.protocol === 'postgresql:'
+        && url.hostname === '127.0.0.1'
+        && /^\d+$/.test(url.port)
+        && url.username === 'postgres'
+        && Boolean(url.password)
+        && url.pathname === `/${expectedDatabase}`
+        && (url.search === '' || url.search === '?schema=public')
+        && url.hash === '',
+        `${label}_must_be_disposable_loopback_database`,
+    )
+    return url.toString()
+}
+
+async function restoreDatabase(context) {
+    if (DATABASE_ENGINE === 'sqlite') {
+        const restoredDatabasePath = path.join(context.temporaryDirectory, 'ippon-restored.sqlite')
+        await copyFile(context.databasePath, restoredDatabasePath)
+        await chmod(restoredDatabasePath, 0o600)
+        return {
+            ...context,
+            databasePath: restoredDatabasePath,
+            databaseUrl: `file:${restoredDatabasePath}`,
+        }
+    }
+
+    const containerName = process.env.IPPON_REGTEST_POSTGRES_CONTAINER || ''
+    requireCondition(
+        /^ippon-regtest-postgres-[0-9a-f]{16}$/.test(containerName),
+        'postgres_container_name_invalid',
+    )
+    const dockerPath = process.env.IPPON_REGTEST_DOCKER_BIN || 'docker'
+    const dumpPath = `/tmp/ippon-regtest-${crypto.randomBytes(8).toString('hex')}.dump`
+    const primaryDatabase = 'ippon_regtest_primary'
+    const restoreDatabaseName = 'ippon_regtest_restore'
+    const dump = await runProcess(dockerPath, [
+        'exec',
+        '--user',
+        'postgres',
+        containerName,
+        'pg_dump',
+        '--format=custom',
+        '--no-owner',
+        '--no-privileges',
+        '--file',
+        dumpPath,
+        '--username',
+        'postgres',
+        primaryDatabase,
+    ], {
+        env: process.env,
+        label: 'postgres_logical_dump',
+    })
+    requireCondition(dump.code === 0, 'postgres_logical_dump_failed')
+    const restored = await runProcess(dockerPath, [
+        'exec',
+        '--user',
+        'postgres',
+        containerName,
+        'pg_restore',
+        '--exit-on-error',
+        '--no-owner',
+        '--no-privileges',
+        '--dbname',
+        restoreDatabaseName,
+        '--username',
+        'postgres',
+        dumpPath,
+    ], {
+        env: process.env,
+        label: 'postgres_logical_restore',
+    })
+    requireCondition(restored.code === 0, 'postgres_logical_restore_failed')
+    return {
+        ...context,
+        databasePath: undefined,
+        databaseUrl: validatedPostgresqlUrl(
+            process.env.IPPON_REGTEST_RESTORE_DATABASE_URL || '',
+            restoreDatabaseName,
+            'postgres_restore_database_url',
+        ),
+    }
 }
 
 async function fundDisposableWallet(context) {
@@ -325,6 +433,14 @@ async function readFaultState(faultStatePath) {
     return JSON.parse(await readFile(faultStatePath, 'utf8'))
 }
 
+async function readRequestCounts(requestLogPath) {
+    const counts = { melt: 0, mint: 0 }
+    for (const line of (await readFile(requestLogPath, 'utf8')).split(/\r?\n/)) {
+        if (line === 'melt' || line === 'mint') counts[line] += 1
+    }
+    return counts
+}
+
 async function main() {
     requireCondition(
         process.env.IPPON_REGTEST_FAULT_ACK === ACKNOWLEDGEMENT,
@@ -333,6 +449,10 @@ async function main() {
     requireCondition(FUNDING_FAKE_SATS <= 25, 'fake_funding_limit_exceeded')
     requireCondition(PAYMENT_FAKE_SATS <= 1, 'fake_payment_limit_exceeded')
     requireCondition(RECEIVE_FAKE_SATS <= 2, 'fake_receive_limit_exceeded')
+    requireCondition(
+        DATABASE_ENGINE === 'sqlite' || DATABASE_ENGINE === 'postgresql',
+        'unsupported_regtest_database_engine',
+    )
     await access(appPath)
     await access(hookPath)
     await access(pythonHookPath)
@@ -342,12 +462,31 @@ async function main() {
     await access(path.join(nutshellPath, 'cashu', 'lightning', 'fake.py'))
 
     const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'ippon-regtest-fault-'))
-    const databasePath = path.join(temporaryDirectory, 'ippon.sqlite')
+    const databasePath = DATABASE_ENGINE === 'sqlite'
+        ? path.join(temporaryDirectory, 'ippon.sqlite')
+        : undefined
+    const databaseUrl = DATABASE_ENGINE === 'sqlite'
+        ? `file:${databasePath}`
+        : validatedPostgresqlUrl(
+            process.env.IPPON_REGTEST_DATABASE_URL || '',
+            'ippon_regtest_primary',
+            'postgres_database_url',
+        )
     const faultStatePath = path.join(temporaryDirectory, 'fault-state.json')
-    const context = { databasePath, faultStatePath }
+    const requestLogPath = path.join(temporaryDirectory, 'request-log.txt')
+    const context = {
+        databasePath,
+        databaseUrl,
+        faultStatePath,
+        requestLogPath,
+        temporaryDirectory,
+    }
     let prisma
     const localMints = []
     let summary
+    let postgresqlConcurrency
+    let faultMeltPosts
+    let faultMintPosts
 
     try {
         await writeFile(faultStatePath, `${JSON.stringify({
@@ -368,13 +507,23 @@ async function main() {
             first_mint_reconcile_blocked: false,
             mint_http_status: null,
         })}\n`, { mode: 0o600 })
-        // Prisma's schema engine checks SQLite connectivity before `db push`;
-        // create the private empty file first so that check remains local and
-        // deterministic on every supported host.
-        await writeFile(databasePath, '', { mode: 0o600 })
-        await setupDatabase(databasePath)
+        await writeFile(requestLogPath, '', { mode: 0o600 })
+        if (DATABASE_ENGINE === 'sqlite') {
+            // Prisma's schema engine checks SQLite connectivity before `db push`;
+            // create the private empty file first so that check remains local and
+            // deterministic on every supported host.
+            await writeFile(databasePath, '', { mode: 0o600 })
+        }
+        // The generated client is a disposable build artifact. Regenerate the
+        // selected provider at startup so a host restart cannot leave a prior
+        // PostgreSQL drill's client wired to the SQLite scenario or vice versa.
+        await generatePrismaClient(schemaPath, `${DATABASE_ENGINE}_prisma_generate`)
+        await setupDatabase(context)
         const sourcePreimage = crypto.randomBytes(32).toString('hex')
         const destinationPreimage = crypto.randomBytes(32).toString('hex')
+        const concurrentDestinationPreimage = DATABASE_ENGINE === 'postgresql'
+            ? crypto.randomBytes(32).toString('hex')
+            : undefined
         const destinationMint = await startLocalNutshell(
             nutshellPath,
             temporaryDirectory,
@@ -382,15 +531,29 @@ async function main() {
             destinationPreimage,
         )
         localMints.push(destinationMint)
+        let concurrentDestinationMint
+        if (concurrentDestinationPreimage) {
+            concurrentDestinationMint = await startLocalNutshell(
+                nutshellPath,
+                temporaryDirectory,
+                'concurrent-destination',
+                concurrentDestinationPreimage,
+            )
+            localMints.push(concurrentDestinationMint)
+        }
         const sourceMint = await startLocalNutshell(
             nutshellPath,
             temporaryDirectory,
             'source',
             sourcePreimage,
-            [destinationPreimage],
+            [destinationPreimage, concurrentDestinationPreimage].filter(Boolean),
         )
         localMints.push(sourceMint)
-        process.env.IPPON_REGTEST_ALLOWED_ORIGINS = `${sourceMint.origin},${destinationMint.origin}`
+        process.env.IPPON_REGTEST_ALLOWED_ORIGINS = [
+            sourceMint.origin,
+            destinationMint.origin,
+            concurrentDestinationMint?.origin,
+        ].filter(Boolean).join(',')
         process.env.IPPON_REGTEST_FAULT_ORIGIN = sourceMint.origin
 
         const sourceAccessKey = await fundDisposableWallet(context)
@@ -443,6 +606,7 @@ async function main() {
         )
         requireCondition(unknown.error_code === 'reconciliation_unavailable', 'unknown_reason_mismatch')
         requireCondition(faultState.melt_posts === 1, 'melt_post_count_after_execute_mismatch')
+        faultMeltPosts = faultState.melt_posts
         requireCondition(faultState.melt_response_dropped === true, 'melt_response_was_not_dropped')
         requireCondition(faultState.first_reconcile_blocked === true, 'first_reconcile_was_not_blocked')
 
@@ -476,9 +640,9 @@ async function main() {
             .digest('hex')
         requireCondition(preimageHash === prepared.payment_hash, 'paid_preimage_mismatch')
 
-        process.env.DATABASE_URL = `file:${databasePath}`
+        process.env.DATABASE_URL = databaseUrl
         const { PrismaClient } = await import('@prisma/client')
-        prisma = new PrismaClient({ datasources: { db: { url: `file:${databasePath}` } } })
+        prisma = new PrismaClient({ datasources: { db: { url: databaseUrl } } })
         const operation = await prisma.meltOperation.findUnique({ where: { intentId } })
         requireCondition(operation?.state === 'PAID', 'database_operation_not_paid')
         requireCondition(operation.executionCount === 1, 'database_execution_count_mismatch')
@@ -494,13 +658,26 @@ async function main() {
         requireCondition(pendingProofs === 0, 'database_pending_proofs_remain')
         requireCondition(reservedProofs === 0, 'database_reserved_proofs_remain')
         requireCondition(spentProofs === paid.proof_states.length, 'database_spent_proof_count_mismatch')
-        const integrityRows = await prisma.$queryRawUnsafe('PRAGMA integrity_check')
-        requireCondition(
-            Array.isArray(integrityRows)
-            && integrityRows.length === 1
-            && Object.values(integrityRows[0])[0] === 'ok',
-            'database_integrity_check_failed',
-        )
+        if (DATABASE_ENGINE === 'sqlite') {
+            const integrityRows = await prisma.$queryRawUnsafe('PRAGMA integrity_check')
+            requireCondition(
+                Array.isArray(integrityRows)
+                && integrityRows.length === 1
+                && Object.values(integrityRows[0])[0] === 'ok',
+                'database_integrity_check_failed',
+            )
+        } else {
+            const databaseRows = await prisma.$queryRawUnsafe(
+                'SELECT current_database() AS database_name, pg_is_in_recovery() AS in_recovery',
+            )
+            requireCondition(
+                Array.isArray(databaseRows)
+                && databaseRows.length === 1
+                && databaseRows[0].database_name === 'ippon_regtest_primary'
+                && databaseRows[0].in_recovery === false,
+                'postgres_database_identity_check_failed',
+            )
+        }
 
         const balanceBeforeReceive = await runCliSuccess(
             `wallet ${sourceAccessKey} balance`,
@@ -602,6 +779,7 @@ async function main() {
             faultState.mint_posts === mintPostsBeforeExecute + 1,
             'mint_post_count_after_execute_mismatch',
         )
+        faultMintPosts = faultState.mint_posts - mintPostsBeforeExecute
         requireCondition(faultState.mint_response_dropped === true, 'mint_response_was_not_dropped')
         requireCondition(
             faultState.first_mint_reconcile_blocked === true,
@@ -643,7 +821,149 @@ async function main() {
             faultState.mint_posts === mintPostsBeforeExecute + 1,
             'mint_was_retried_after_restart',
         )
+        requireCondition(
+            faultState.melt_posts === faultMeltPosts,
+            'melt_was_retried_after_restart',
+        )
         requireCondition(faultState.restore_posts > 0, 'nut09_restore_was_not_used')
+
+        if (DATABASE_ENGINE === 'postgresql') {
+            const concurrentInvoice = await createPaymentInvoice(
+                context,
+                concurrentDestinationMint.origin,
+            )
+            const concurrentPayIntentId = `wallet_${crypto.randomBytes(12).toString('hex')}`
+            const concurrentPayPrepared = await runCliSuccess(
+                `wallet ${sourceAccessKey} pay-prepare ${concurrentPayIntentId} ${concurrentInvoice}`,
+                { ...context, label: 'postgres_concurrent_payment_prepare' },
+            )
+            const requestCountsBeforePayConcurrency = await readRequestCounts(requestLogPath)
+            const concurrentPayCommand = `wallet ${sourceAccessKey} pay-execute ${concurrentPayIntentId} ${concurrentPayPrepared.invoice_sha256} ${concurrentPayPrepared.quote_sha256} ${concurrentPayPrepared.proof_plan_sha256}`
+            const concurrentPayResults = await Promise.all([
+                runCli(concurrentPayCommand, {
+                    ...context,
+                    label: 'postgres_concurrent_payment_execute_a',
+                }),
+                runCli(concurrentPayCommand, {
+                    ...context,
+                    label: 'postgres_concurrent_payment_execute_b',
+                }),
+            ])
+            const concurrentPaySuccesses = concurrentPayResults.filter(result => result?.error !== true)
+            requireCondition(
+                concurrentPaySuccesses.length === 1
+                && concurrentPaySuccesses[0].state === 'PAID',
+                'postgres_concurrent_payment_not_one_shot',
+            )
+            const requestCountsAfterPayConcurrency = await readRequestCounts(requestLogPath)
+            requireCondition(
+                requestCountsAfterPayConcurrency.melt === requestCountsBeforePayConcurrency.melt + 1,
+                'postgres_concurrent_payment_reached_mint_more_than_once',
+            )
+            const concurrentPayOperation = await prisma.meltOperation.findUnique({
+                where: { intentId: concurrentPayIntentId },
+            })
+            requireCondition(
+                concurrentPayOperation?.state === 'PAID'
+                && concurrentPayOperation.executionCount === 1,
+                'postgres_concurrent_payment_database_mismatch',
+            )
+
+            const concurrentReceiveIntentId = `wallet_${crypto.randomBytes(12).toString('hex')}`
+            const concurrentReceivePrepared = await runCliSuccess(
+                `wallet ${sourceAccessKey} receive-prepare ${concurrentReceiveIntentId} ${RECEIVE_FAKE_SATS}`,
+                { ...context, label: 'postgres_concurrent_receive_prepare' },
+            )
+            let concurrentReceivePaid
+            let lastConcurrentReceiveStatus
+            for (let attempt = 0; attempt < MAX_STATUS_ATTEMPTS; attempt += 1) {
+                const status = await runCliSuccess(
+                    `wallet ${sourceAccessKey} receive-status ${concurrentReceiveIntentId}`,
+                    { ...context, label: 'postgres_concurrent_receive_wait_for_paid' },
+                )
+                lastConcurrentReceiveStatus = status
+                if (status.state === 'PAID') {
+                    concurrentReceivePaid = status
+                    break
+                }
+                await delay(750)
+            }
+            requireCondition(
+                concurrentReceivePaid?.state === 'PAID',
+                `postgres_concurrent_receive_not_paid_${lastConcurrentReceiveStatus?.state || 'missing'}`,
+            )
+            const requestCountsBeforeReceiveConcurrency = await readRequestCounts(requestLogPath)
+            const concurrentReceiveCommand = `wallet ${sourceAccessKey} receive-execute ${concurrentReceiveIntentId} ${concurrentReceivePrepared.invoice_sha256} ${concurrentReceivePrepared.quote_sha256} ${concurrentReceivePrepared.output_plan_sha256}`
+            const concurrentReceiveResults = await Promise.all([
+                runCli(concurrentReceiveCommand, {
+                    ...context,
+                    label: 'postgres_concurrent_receive_execute_a',
+                }),
+                runCli(concurrentReceiveCommand, {
+                    ...context,
+                    label: 'postgres_concurrent_receive_execute_b',
+                }),
+            ])
+            const concurrentReceiveOutcomes = concurrentReceiveResults.map(result => (
+                result?.error === true
+                    ? `error-${result.code || 'unknown'}`
+                    : `state-${result?.state || 'missing'}`
+            )).join('_')
+            requireCondition(
+                concurrentReceiveResults.every(
+                    result => result?.error === true
+                        || result?.state === 'UNKNOWN'
+                        || result?.state === 'ISSUED',
+                ),
+                `postgres_concurrent_receive_result_invalid_${concurrentReceiveOutcomes}`,
+            )
+            let concurrentReceiveIssued
+            let lastConcurrentRecoveryStatus
+            for (let attempt = 0; attempt < MAX_STATUS_ATTEMPTS; attempt += 1) {
+                const status = await runCliSuccess(
+                    `wallet ${sourceAccessKey} receive-status ${concurrentReceiveIntentId}`,
+                    { ...context, label: 'postgres_concurrent_receive_recovery' },
+                )
+                lastConcurrentRecoveryStatus = status
+                if (status.state === 'ISSUED') {
+                    concurrentReceiveIssued = status
+                    break
+                }
+                await delay(750)
+            }
+            requireCondition(
+                concurrentReceiveIssued?.state === 'ISSUED',
+                `postgres_concurrent_receive_not_recovered_${lastConcurrentRecoveryStatus?.state || 'missing'}`,
+            )
+            const requestCountsAfterReceiveConcurrency = await readRequestCounts(requestLogPath)
+            requireCondition(
+                requestCountsAfterReceiveConcurrency.mint
+                    === requestCountsBeforeReceiveConcurrency.mint + 1,
+                'postgres_concurrent_receive_reached_mint_more_than_once',
+            )
+            const concurrentReceiveOperation = await prisma.mintOperation.findUnique({
+                where: { intentId: concurrentReceiveIntentId },
+            })
+            requireCondition(
+                concurrentReceiveOperation?.state === 'ISSUED'
+                && concurrentReceiveOperation.executionCount === 1
+                && concurrentReceiveOperation.quotePrivkey === null
+                && concurrentReceiveOperation.outputDataJson === null
+                && concurrentReceiveOperation.signature === null,
+                'postgres_concurrent_receive_database_mismatch',
+            )
+            postgresqlConcurrency = {
+                payment_execute_callers: concurrentPayResults.length,
+                payment_melt_posts: requestCountsAfterPayConcurrency.melt
+                    - requestCountsBeforePayConcurrency.melt,
+                payment_execution_count: concurrentPayOperation.executionCount,
+                receive_execute_callers: concurrentReceiveResults.length,
+                receive_mint_posts: requestCountsAfterReceiveConcurrency.mint
+                    - requestCountsBeforeReceiveConcurrency.mint,
+                receive_execution_count: concurrentReceiveOperation.executionCount,
+                terminal_private_material_cleared: true,
+            }
+        }
 
         const sourceAudit = await runCliSuccess(
             `restore-audit ${sourceMint.origin}`,
@@ -659,14 +979,11 @@ async function main() {
 
         await prisma.$disconnect()
         prisma = undefined
-        const restoredDatabasePath = path.join(temporaryDirectory, 'ippon-restored.sqlite')
-        await copyFile(databasePath, restoredDatabasePath)
-        await chmod(restoredDatabasePath, 0o600)
+        const restoredContext = await restoreDatabase(context)
         const restoredAudit = await runCliSuccess(
             `restore-audit ${sourceMint.origin}`,
             {
-                ...context,
-                databasePath: restoredDatabasePath,
+                ...restoredContext,
                 label: 'restored_full_proof_audit',
             },
         )
@@ -676,10 +993,15 @@ async function main() {
         )
 
         faultState = await readFaultState(faultStatePath)
-        requireCondition(faultState.melt_posts === 1, 'melt_was_retried_after_restart')
+        const finalRequestCounts = await readRequestCounts(requestLogPath)
+        requireCondition(
+            finalRequestCounts.melt === faultMeltPosts + (DATABASE_ENGINE === 'postgresql' ? 1 : 0),
+            'unexpected_total_melt_post_count',
+        )
         summary = {
             ok: true,
             environment: 'official-nutshell-local-fakewallet-regtest',
+            database_engine: DATABASE_ENGINE,
             fake_sats: {
                 funded: FUNDING_FAKE_SATS,
                 payment: PAYMENT_FAKE_SATS,
@@ -689,7 +1011,7 @@ async function main() {
                 accepted_melt_response_dropped: true,
                 first_reconciliation_blocked: true,
                 immediate_state: 'UNKNOWN',
-                melt_posts: faultState.melt_posts,
+                melt_posts: faultMeltPosts,
             },
             restart_recovery: {
                 method: 'pay-status-only',
@@ -699,7 +1021,7 @@ async function main() {
                 local_pending_proofs: pendingProofs,
                 local_reserved_proofs: reservedProofs,
                 preimage_verified: true,
-                sqlite_integrity: 'ok',
+                database_integrity: 'ok',
             },
             locked_receive_recovery: {
                 method: 'receive-status-with-nut09-restore',
@@ -708,12 +1030,13 @@ async function main() {
                 proofs_issued: receiveIssued.proofs_issued,
                 accepted_mint_response_dropped: faultState.mint_response_dropped,
                 first_reconciliation_blocked: faultState.first_mint_reconcile_blocked,
-                mint_posts: faultState.mint_posts - mintPostsBeforeExecute,
+                mint_posts: faultMintPosts,
                 restore_posts: faultState.restore_posts,
                 terminal_private_material_cleared: true,
             },
             approval_tamper_rejected_before_melt: true,
             receive_approval_tamper_rejected_before_mint: true,
+            postgresql_concurrency: postgresqlConcurrency,
             change_bearing_proof_plan: {
                 maximum_spend: prepared.max_spend,
                 proof_input_total: prepared.proof_input_total,
@@ -734,6 +1057,9 @@ async function main() {
     } finally {
         if (prisma) await prisma.$disconnect()
         for (const mint of localMints) await stopProcess(mint.child)
+        if (DATABASE_ENGINE === 'postgresql') {
+            await generatePrismaClient(sqliteSchemaPath, 'sqlite_prisma_restore')
+        }
         await rm(temporaryDirectory, { recursive: true, force: true })
         try {
             await access(temporaryDirectory)
