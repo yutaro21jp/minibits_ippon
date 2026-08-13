@@ -279,7 +279,7 @@ async function expirePrepared(operation: MeltOperation, proofs: Proof[]): Promis
                     reservedByIntentId: operation.intentId,
                 },
             })
-            if (reserved !== secrets.length) {
+            if (reserved !== 0 && reserved !== secrets.length) {
                 return tx.meltOperation.update({
                     where: { intentId: operation.intentId },
                     data: {
@@ -289,17 +289,19 @@ async function expirePrepared(operation: MeltOperation, proofs: Proof[]): Promis
                     },
                 })
             }
-            const released = await tx.proof.updateMany({
-                where: {
-                    walletId: operation.walletId,
-                    secret: { in: secrets },
-                    status: ProofStatus.PENDING,
-                    reservedByIntentId: operation.intentId,
-                },
-                data: { status: ProofStatus.UNSPENT, reservedByIntentId: null },
-            })
-            if (released.count !== secrets.length) {
-                fail('PROOF_RESERVATION_MISMATCH', 'The prepared proofs could not be released atomically')
+            if (reserved === secrets.length) {
+                const released = await tx.proof.updateMany({
+                    where: {
+                        walletId: operation.walletId,
+                        secret: { in: secrets },
+                        status: ProofStatus.PENDING,
+                        reservedByIntentId: operation.intentId,
+                    },
+                    data: { status: ProofStatus.UNSPENT, reservedByIntentId: null },
+                })
+                if (released.count !== secrets.length) {
+                    fail('PROOF_RESERVATION_MISMATCH', 'The prepared proofs could not be released atomically')
+                }
             }
             return tx.meltOperation.update({
                 where: { intentId: operation.intentId },
@@ -325,17 +327,30 @@ async function reserveExecution(operation: MeltOperation, proofs: Proof[]): Prom
             fail('OPERATION_ALREADY_EXECUTED', 'The prepared payment is no longer executable')
         }
         const secrets = proofs.map(proof => proof.secret)
-        const reserved = await tx.proof.updateMany({
+        const alreadyReserved = await tx.proof.count({
             where: {
                 walletId: operation.walletId,
                 secret: { in: secrets },
                 status: ProofStatus.PENDING,
                 reservedByIntentId: operation.intentId,
             },
-            data: { status: ProofStatus.PENDING },
         })
-        if (reserved.count !== secrets.length) {
-            fail('PROOF_RESERVATION_MISMATCH', 'The prepared proofs are no longer reserved')
+        if (alreadyReserved !== 0 && alreadyReserved !== secrets.length) {
+            fail('PROOF_RESERVATION_MISMATCH', 'The prepared proof reservation is incomplete')
+        }
+        if (alreadyReserved === 0) {
+            const reserved = await tx.proof.updateMany({
+                where: {
+                    walletId: operation.walletId,
+                    secret: { in: secrets },
+                    status: ProofStatus.UNSPENT,
+                    reservedByIntentId: null,
+                },
+                data: { status: ProofStatus.PENDING, reservedByIntentId: operation.intentId },
+            })
+            if (reserved.count !== secrets.length) {
+                fail('PROOF_RESERVATION_MISMATCH', 'The approved proofs are no longer available')
+            }
         }
         const updated = await tx.meltOperation.updateMany({
             where: {
@@ -610,7 +625,7 @@ async function prepare(
     const operation = await prisma.$transaction(async tx => {
         const duplicate = await tx.meltOperation.findUnique({ where: { intentId } })
         if (duplicate) fail('DUPLICATE_INTENT', 'The payment intent already exists')
-        const operation = await tx.meltOperation.create({
+        return tx.meltOperation.create({
             data: {
                 intentId,
                 walletId: storedWallet.id,
@@ -627,19 +642,6 @@ async function prepare(
                 state: MeltOperationState.PREPARED,
             },
         })
-        const reserved = await tx.proof.updateMany({
-            where: {
-                walletId: storedWallet.id,
-                secret: { in: secrets },
-                status: ProofStatus.UNSPENT,
-                reservedByIntentId: null,
-            },
-            data: { status: ProofStatus.PENDING, reservedByIntentId: intentId },
-        })
-        if (reserved.count !== secrets.length) {
-            fail('PROOF_RESERVATION_MISMATCH', 'The selected proofs could not be reserved atomically')
-        }
-        return operation
     })
 
     const hashes = hashesFor(operation)

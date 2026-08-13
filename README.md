@@ -15,14 +15,14 @@ The upstream project gives software a small Cashu wallet that can receive and
 send ecash and pay Lightning invoices. This fork adds a safer local-CLI payment
 boundary for systems that must not pay immediately when an invoice arrives:
 
-1. `pay-prepare` obtains the Cashu melt quote, selects and reserves proofs, and
-   returns the amount, fee ceiling, maximum spend, temporarily submitted proof
+1. `pay-prepare` obtains the Cashu melt quote, selects proofs without reserving them, and
+   returns the amount, fee ceiling, maximum spend, planned proof
    total, minimum change, expiry, payment hash, and approval hashes. It does not
    pay.
 2. An external application can show those values to a person or apply its own
    approval policy without receiving the raw quote ID or proofs.
-3. `pay-execute` accepts only the unchanged approval hashes and attempts the
-   payment once.
+3. `pay-execute` accepts only the unchanged approval hashes, atomically reserves
+   the exact approved proofs, and attempts the payment once.
 4. `pay-status` reconciles PENDING or UNKNOWN outcomes after a timeout or
    restart. It never retries the melt.
 

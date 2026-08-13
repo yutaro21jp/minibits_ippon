@@ -287,7 +287,7 @@ describe('SplitMeltService', () => {
         })
     })
 
-    it('prepares and reserves an exact proof plan without spending', async () => {
+    it('prepares an exact proof plan without spending or reserving proofs', async () => {
         const result = await SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE)
 
         expect(result).toMatchObject({
@@ -300,8 +300,8 @@ describe('SplitMeltService', () => {
             minimum_change: 0,
             payment_hash: PAYMENT_HASH,
         })
-        expect(proofStatus).toBe(ProofStatus.PENDING)
-        expect(reservedByIntentId).toBe(INTENT_ID)
+        expect(proofStatus).toBe(ProofStatus.UNSPENT)
+        expect(reservedByIntentId).toBeNull()
         expect(operation.keysetId).toBe('keyset-1')
         expect(operation.request).toBe(INVOICE)
         expect(operation.quoteId).toBe('private-quote-id')
@@ -381,14 +381,25 @@ describe('SplitMeltService', () => {
         expect(operation).toBeNull()
     })
 
-    it('rolls back preparation when every selected proof cannot be reserved', async () => {
-        mocks.proofUpdateMany.mockResolvedValueOnce({ count: 0 })
+    it('leaves proofs available while approval is pending', async () => {
+        await SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE)
 
-        await expect(SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE))
-            .rejects.toMatchObject({ code: 'PROOF_RESERVATION_MISMATCH' })
         expect(mocks.meltOperationCreate).toHaveBeenCalledTimes(1)
-        expect(operation).toBeNull()
+        expect(mocks.proofUpdateMany).not.toHaveBeenCalled()
         expect(proofStatus).toBe(ProofStatus.UNSPENT)
+        expect(reservedByIntentId).toBeNull()
+    })
+
+    it('fails closed at execution when the approved proofs are no longer available', async () => {
+        const prepared = await SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE)
+        proofStatus = ProofStatus.SPENT
+
+        await expect(SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared)))
+            .rejects.toMatchObject({ code: 'PROOF_RESERVATION_MISMATCH' })
+
+        expect(operation.state).toBe(MeltOperationState.PREPARED)
+        expect(operation.executionCount).toBe(0)
+        expect(mocks.completeMelt).not.toHaveBeenCalled()
     })
 
     it('reconstructs the persisted preview, executes once, and verifies the preimage', async () => {
@@ -439,7 +450,7 @@ describe('SplitMeltService', () => {
         expect(operation.executionCount).toBe(1)
     })
 
-    it('expires without executing and releases every reserved proof', async () => {
+    it('expires without executing and leaves proofs unreserved', async () => {
         const prepared = await SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE)
         vi.spyOn(Date, 'now').mockReturnValue((NOW + 3_601) * 1000)
 
