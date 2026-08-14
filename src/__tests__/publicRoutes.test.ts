@@ -156,6 +156,7 @@ describe('POST /v1/wallet', () => {
 
         expect(res.statusCode).toBe(400)
         expect(res.json().error.name).toBe('LIMIT_ERROR')
+        expect(mocks.prismaProofDeleteMany).toHaveBeenCalledWith({ where: { walletId: CREATED_WALLET.id } })
         expect(mocks.prismaWalletDelete).toHaveBeenCalled()
     })
 
@@ -170,6 +171,23 @@ describe('POST /v1/wallet', () => {
         })
 
         expect(res.statusCode).toBe(400)
+        expect(mocks.prismaProofDeleteMany).toHaveBeenCalledWith({ where: { walletId: CREATED_WALLET.id } })
         expect(mocks.prismaWalletDelete).toHaveBeenCalledWith({ where: { id: CREATED_WALLET.id } })
+    })
+
+    it('cleans up wallet if initial token metadata is invalid', async () => {
+        mocks.getTokenAmount.mockImplementationOnce(() => { throw new Error('invalid token metadata') })
+
+        const res = await app.inject({
+            method: 'POST',
+            url: '/v1/wallet',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ token: 'cashuBinvalid' }),
+        })
+
+        expect(res.statusCode).toBe(400)
+        expect(mocks.prismaProofDeleteMany).toHaveBeenCalledWith({ where: { walletId: CREATED_WALLET.id } })
+        expect(mocks.prismaWalletDelete).toHaveBeenCalledWith({ where: { id: CREATED_WALLET.id } })
+        expect(mocks.receiveToken).not.toHaveBeenCalled()
     })
 })

@@ -23,6 +23,13 @@ const limitsSchema = {
     },
 }
 
+// receiveToken persists successful swap batches immediately. If a later batch
+// fails, remove child proofs before discarding the just-created wallet row.
+async function discardWallet(walletId: number) {
+    await prisma.proof.deleteMany({ where: { walletId } })
+    await prisma.wallet.delete({ where: { id: walletId } })
+}
+
 export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
 
     // GET /v1/info
@@ -151,19 +158,18 @@ export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
 
         // If a token was provided, receive it immediately
         if (token) {
-            const maxBalance = wallet.maxBalance ?? parseInt(process.env.MAX_BALANCE || '100000')
-            const tokenAmount = WalletService.getTokenAmount(token)
-            if (tokenAmount.greaterThan(maxBalance)) {
-                await prisma.wallet.delete({ where: { id: wallet.id } })
-                throw new AppError(400, Err.LIMIT_ERROR, `Token amount ${tokenAmount.toString()} exceeds max balance ${maxBalance}`, { caller: 'CreateWallet' })
-            }
-
             try {
+                const maxBalance = wallet.maxBalance ?? parseInt(process.env.MAX_BALANCE || '100000')
+                const tokenAmount = WalletService.getTokenAmount(token)
+                if (tokenAmount.greaterThan(maxBalance)) {
+                    throw new AppError(400, Err.LIMIT_ERROR, `Token amount ${tokenAmount.toString()} exceeds max balance ${maxBalance}`, { caller: 'CreateWallet' })
+                }
+
                 const newProofs = await WalletService.receiveToken(wallet.id, token, resolvedMintUrl)
                 balance = WalletService.getProofsAmount(newProofs).toNumber()
             } catch (e: any) {
+                await discardWallet(wallet.id)
                 if (e instanceof AppError) throw e
-                await prisma.wallet.delete({ where: { id: wallet.id } })
                 throw new AppError(400, Err.VALIDATION_ERROR, `Failed to receive initial token: ${e.message}`, { caller: 'CreateWallet' })
             }
         }

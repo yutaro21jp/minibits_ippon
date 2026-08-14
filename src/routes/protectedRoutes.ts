@@ -364,7 +364,7 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
             throw new AppError(400, Err.VALIDATION_ERROR, 'Token is required', { caller: 'Check', reqId: req.id })
         }
 
-        const { proofStates, token } = await WalletService.checkTokenState(tokenStr)
+        const { proofStates, token } = await WalletService.checkTokenState(tokenStr, wallet.mint)
 
         // Determine overall state
         const states = proofStates.map(s => s.state)

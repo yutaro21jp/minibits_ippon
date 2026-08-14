@@ -12,6 +12,7 @@ import {
     CheckStateEnum,
     MintOperationError,
     OutputConfig,
+    getDecodedToken,
     getTokenMetadata,
     setGlobalRequestOptions,
     sumProofs,
@@ -21,8 +22,17 @@ import prisma from '../utils/prismaClient'
 import AppError, { Err } from '../utils/AppError'
 import { log } from './logService'
 
-const _wallets = new Map<string, Wallet>()
+type CachedWallet = {
+    wallet: Wallet
+    keysetsLoadedAt: number
+}
+
+const _wallets = new Map<string, CachedWallet>()
 const MAX_RESTORE_AUDIT_PROOFS = 10_000
+const configuredKeysetTtlMs = Number(process.env.KEYSET_TTL_MS || 10 * 60 * 1000)
+const KEYSET_TTL_MS = Number.isFinite(configuredKeysetTtlMs) && configuredKeysetTtlMs >= 0
+    ? configuredKeysetTtlMs
+    : 10 * 60 * 1000
 
 // cashu-ts enables implicit NUT-19 retries for endpoints advertised as cached.
 // That is useful for ordinary clients, but an approval-gated melt must have one
@@ -35,9 +45,49 @@ const getMintUrls = function (): string[] {
     return raw.split(',').map(u => u.trim()).filter(u => u.length > 0)
 }
 
+/** Return whether the wallet can still create outputs with its bound keyset. */
+const isBoundKeysetUsable = function (wallet: Wallet): boolean {
+    try {
+        const keyset = wallet.getKeyset()
+        const expiry = keyset.expiry
+        return keyset.isActive && (expiry === undefined || expiry * 1000 > Date.now())
+    } catch {
+        return false
+    }
+}
+
+
+/** Refresh the mint keychain and rebind after a NUT-02 keyset rotation. */
+const refreshKeysets = async function (cached: CachedWallet, mintUrl: string): Promise<void> {
+    await cached.wallet.loadMint(true)
+    cached.keysetsLoadedAt = Date.now()
+
+    if (!isBoundKeysetUsable(cached.wallet)) {
+        const cheapest = cached.wallet.keyChain.getCheapestKeyset()
+        cached.wallet.bindKeyset(cheapest.id)
+        log.info('[refreshKeysets] Rebound wallet to a new keyset', { mintUrl, keysetId: cheapest.id })
+    }
+}
+
+
 const getWallet = async function (mintUrl: string): Promise<Wallet> {
-    if (_wallets.has(mintUrl)) {
-        return _wallets.get(mintUrl)!
+    const cached = _wallets.get(mintUrl)
+    if (cached) {
+        const isStale = Date.now() - cached.keysetsLoadedAt > KEYSET_TTL_MS
+
+        if (isStale || !isBoundKeysetUsable(cached.wallet)) {
+            try {
+                await refreshKeysets(cached, mintUrl)
+            } catch (e: any) {
+                // A refresh failure is tolerable only while the old binding remains usable.
+                log.warn('[getWallet] Keyset refresh failed, keeping cached keysets', { mintUrl, error: e.message })
+                if (!isBoundKeysetUsable(cached.wallet)) {
+                    throw new AppError(500, Err.CONNECTION_ERROR, `Mint has no usable keyset: ${e.message}`, { caller: 'getWallet' })
+                }
+            }
+        }
+
+        return cached.wallet
     }
 
     const unit = process.env.UNIT || 'sat'
@@ -46,7 +96,7 @@ const getWallet = async function (mintUrl: string): Promise<Wallet> {
 
     const cashuWallet = new Wallet(mintUrl, { unit })
     await cashuWallet.loadMint()
-    _wallets.set(mintUrl, cashuWallet)
+    _wallets.set(mintUrl, { wallet: cashuWallet, keysetsLoadedAt: Date.now() })
 
     return cashuWallet
 }
@@ -58,6 +108,73 @@ const getProofsAmount = function (proofs: Array<Pick<ProofLike, 'amount'>>): Amo
 
 const getTokenAmount = function (tokenStr: string): Amount {
     return getTokenMetadata(tokenStr).amount
+}
+
+
+/** Decode cashuB tokens while resolving NUT-02 v2 short keyset IDs. */
+const decodeToken = async function (tokenStr: string): Promise<Token> {
+    const { mint } = getTokenMetadata(tokenStr)
+
+    let cached: CachedWallet | undefined
+    let keysetIds: string[] = []
+
+    try {
+        await getWallet(mint)
+        cached = _wallets.get(mint)
+        keysetIds = cached?.wallet.keyChain.getAllKeysetIds() ?? []
+    } catch (e: any) {
+        log.warn('[decodeToken] Could not load mint keysets, decoding without them', { mint, error: e.message })
+    }
+
+    try {
+        return getDecodedToken(tokenStr, keysetIds)
+    } catch (e: any) {
+        // A short v2 id may refer to a keyset added after the last refresh.
+        if (!cached) throw e
+
+        log.debug('[decodeToken] Decode failed, refreshing keysets and retrying', { mint, error: e.message })
+        await refreshKeysets(cached, mint)
+        return getDecodedToken(tokenStr, cached.wallet.keyChain.getAllKeysetIds())
+    }
+}
+
+
+/** Ensure every input proof references a keyset currently known by cashu-ts. */
+const ensureKeysetsKnown = async function (
+    mintUrl: string,
+    proofs: Array<Pick<ProofLike, 'id'>>,
+): Promise<void> {
+    const cached = _wallets.get(mintUrl)
+    if (!cached) return
+
+    const missing = () => {
+        const known = new Set(cached.wallet.keyChain.getAllKeysetIds())
+        return [...new Set(proofs.map(proof => proof.id).filter(id => !known.has(id)))]
+    }
+
+    const unknownIds = missing()
+    if (unknownIds.length === 0) return
+
+    log.info('[ensureKeysetsKnown] Token references unknown keysets, refreshing from mint', {
+        mintUrl,
+        keysetIds: unknownIds,
+    })
+
+    try {
+        await refreshKeysets(cached, mintUrl)
+    } catch (e: any) {
+        throw new AppError(500, Err.CONNECTION_ERROR, `Could not refresh keysets from mint: ${e.message}`, { caller: 'ensureKeysetsKnown' })
+    }
+
+    const stillUnknown = missing()
+    if (stillUnknown.length > 0) {
+        throw new AppError(
+            400,
+            Err.VALIDATION_ERROR,
+            `Token references keysets that mint ${mintUrl} does not know: ${stillUnknown.join(', ')}`,
+            { caller: 'ensureKeysetsKnown' },
+        )
+    }
 }
 
 
@@ -371,15 +488,17 @@ const sendProofs = async function (walletId: number, amount: AmountLike, mintUrl
 const SWAP_BATCH_SIZE = 100
 
 const receiveToken = async function (walletId: number, tokenStr: string, mintUrl: string): Promise<Proof[]> {
-    const metadata = getTokenMetadata(tokenStr)
-    if (metadata.mint !== mintUrl) {
-        throw new AppError(400, Err.VALIDATION_ERROR, `Token mint '${metadata.mint}' does not match wallet mint '${mintUrl}'`, { caller: 'receiveToken' })
+    // Check the mint before fetching keysets from any token-supplied URL.
+    const { mint: tokenMint } = getTokenMetadata(tokenStr)
+    if (tokenMint !== mintUrl) {
+        throw new AppError(400, Err.VALIDATION_ERROR, `Token mint '${tokenMint}' does not match wallet mint '${mintUrl}'`, { caller: 'receiveToken' })
     }
     const wallet = await getWallet(mintUrl)
-    const decoded = wallet.decodeToken(tokenStr)
+    const decoded = await decodeToken(tokenStr)
+    await ensureKeysetsKnown(mintUrl, decoded.proofs)
 
     if (decoded.proofs.length <= SWAP_BATCH_SIZE) {
-        const newProofs = await wallet.receive(tokenStr)
+        const newProofs = await wallet.receive(decoded)
         await saveProofs(walletId, newProofs, ProofStatus.UNSPENT)
         return newProofs
     }
@@ -395,9 +514,10 @@ const receiveToken = async function (walletId: number, tokenStr: string, mintUrl
         const preview = await wallet.prepareSwapToReceive(batchToken)
         const { keep } = await wallet.completeSwap(preview)
         allNewProofs.push(...keep)
+        // Persist each completed batch so a later failure cannot orphan swapped proofs.
+        await saveProofs(walletId, keep, ProofStatus.UNSPENT)
     }
 
-    await saveProofs(walletId, allNewProofs, ProofStatus.UNSPENT)
     return allNewProofs
 }
 
@@ -568,10 +688,21 @@ const syncProofsStateWithMint = async function (walletId: number, mintUrl: strin
 }
 
 
-const checkTokenState = async function (tokenStr: string): Promise<{ proofStates: ProofState[], token: Token }> {
-    const metadata = getTokenMetadata(tokenStr)
-    const wallet = await getWallet(metadata.mint)
-    const token = wallet.decodeToken(tokenStr)
+const checkTokenState = async function (
+    tokenStr: string,
+    expectedMint?: string,
+): Promise<{ proofStates: ProofState[], token: Token }> {
+    const { mint } = getTokenMetadata(tokenStr)
+    if (expectedMint && mint !== expectedMint) {
+        throw new AppError(
+            400,
+            Err.VALIDATION_ERROR,
+            `Token mint '${mint}' does not match wallet mint '${expectedMint}'`,
+            { caller: 'checkTokenState' },
+        )
+    }
+    const token = await decodeToken(tokenStr)
+    const wallet = await getWallet(token.mint)
     const proofStates = await wallet.checkProofsStates(token.proofs)
     return { proofStates, token }
 }
@@ -582,6 +713,7 @@ export const WalletService = {
     getWallet,
     getProofsAmount,
     getTokenAmount,
+    decodeToken,
     getWalletBalance,
     saveProofs,
     proofStorageData,

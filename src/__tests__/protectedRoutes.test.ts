@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
     sendProofs: vi.fn(),
     receiveToken: vi.fn(),
     getProofsAmount: vi.fn(),
+    getTokenAmount: vi.fn(),
     createMeltQuote: vi.fn(),
     meltProofs: vi.fn(),
     checkMeltQuote: vi.fn(),
@@ -58,6 +59,7 @@ vi.mock('../services/walletService', () => ({
         sendProofs: mocks.sendProofs,
         receiveToken: mocks.receiveToken,
         getProofsAmount: mocks.getProofsAmount,
+        getTokenAmount: mocks.getTokenAmount,
         createMeltQuote: mocks.createMeltQuote,
         meltProofs: mocks.meltProofs,
         checkMeltQuote: mocks.checkMeltQuote,
@@ -324,6 +326,9 @@ describe('POST /v1/wallet/receive', () => {
             balance: Amount.zero(),
             pendingBalance: Amount.zero(),
         })
+        mocks.getTokenAmount.mockReturnValue(Amount.from(100))
+        mocks.getProofsAmount.mockReturnValue(Amount.from(100))
+        mocks.receiveToken.mockResolvedValue([])
         app = await buildApp()
         await app.ready()
     })
@@ -331,6 +336,41 @@ describe('POST /v1/wallet/receive', () => {
     it('rejects missing token field', async () => {
         const res = await post(app, '/v1/wallet/receive', {})
         expect(res.statusCode).toBe(400)
+    })
+
+    it('checks the token amount before receiving it', async () => {
+        const res = await post(app, '/v1/wallet/receive', { token: 'cashuBtest' })
+
+        expect(res.statusCode).toBe(200)
+        expect(mocks.getTokenAmount).toHaveBeenCalledWith('cashuBtest')
+        expect(mocks.receiveToken).toHaveBeenCalledWith(WALLET.id, 'cashuBtest', WALLET.mint)
+    })
+})
+
+describe('POST /v1/wallet/check', () => {
+    let app: FastifyInstance
+
+    beforeEach(async () => {
+        vi.clearAllMocks()
+        mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
+        mocks.checkTokenState.mockResolvedValue({
+            proofStates: [{ state: 'UNSPENT' }],
+            token: {
+                mint: WALLET.mint,
+                unit: 'sat',
+                proofs: [{ id: 'proof-id', amount: Amount.from(1), secret: 'secret', C: 'C' }],
+            },
+        })
+        mocks.getProofsAmount.mockReturnValue(Amount.from(1))
+        app = await buildApp()
+        await app.ready()
+    })
+
+    it('binds token-state lookup to the authenticated wallet mint', async () => {
+        const res = await post(app, '/v1/wallet/check', { token: 'cashuBtest' })
+
+        expect(res.statusCode).toBe(200)
+        expect(mocks.checkTokenState).toHaveBeenCalledWith('cashuBtest', WALLET.mint)
     })
 })
 
