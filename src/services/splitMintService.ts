@@ -12,12 +12,19 @@ import {
 import {
     MintOperation,
     MintOperationState,
+    Prisma,
     ProofStatus,
     Wallet as StoredWallet,
 } from '@prisma/client'
 import { decode as decodeBolt11 } from '@gandlaf21/bolt11-decode'
 import prisma from '../utils/prismaClient'
 import { WalletService } from './walletService'
+import {
+    ApprovalCapabilityError,
+    buildApprovalPayload,
+    verifyApprovalSignature,
+    walletApprovalId,
+} from './approvalCapability'
 
 const INTENT_ID = /^wallet_[0-9a-f]{24}$/
 const HASH_HEX = /^[0-9a-f]{64}$/
@@ -45,6 +52,7 @@ type ReceiveEvidence = {
     proofs_issued: number
     balance: number | null
     error_code: string | null
+    approval_payload?: string
 }
 
 export class SplitMintError extends Error {
@@ -69,6 +77,31 @@ function boundaryNumber(value: Amount, field: string): number {
     return value.toNumber()
 }
 
+function effectiveMaxBalance(storedWallet: StoredWallet): Amount {
+    const configured = Number(process.env.MAX_BALANCE ?? 100_000)
+    if (
+        !Number.isSafeInteger(configured)
+        || configured <= 0
+        || configured > MAX_BOUNDARY_AMOUNT.toNumber()
+    ) {
+        fail('INVALID_LIMIT_CONFIG', 'MAX_BALANCE must be a positive supported integer')
+    }
+    if (
+        storedWallet.maxBalance !== null
+        && (
+            !Number.isSafeInteger(storedWallet.maxBalance)
+            || storedWallet.maxBalance <= 0
+        )
+    ) {
+        fail('INVALID_LIMIT_CONFIG', 'The stored wallet balance limit is invalid')
+    }
+    return Amount.from(
+        storedWallet.maxBalance === null
+            ? configured
+            : Math.min(storedWallet.maxBalance, configured),
+    )
+}
+
 function expiryNumber(value: bigint | null): number | null {
     if (value === null) return null
     const numeric = Number(value)
@@ -89,7 +122,7 @@ function generateQuoteKey(): { privkey: string, pubkey: string } {
     return { privkey, pubkey }
 }
 
-function validateInvoice(invoice: string): void {
+function validateInvoice(invoice: string, expectedAmount: number): void {
     if (
         invoice.length === 0
         || invoice.length > MAX_INVOICE_LENGTH
@@ -99,8 +132,16 @@ function validateInvoice(invoice: string): void {
         fail('INVALID_MINT_QUOTE', 'The mint returned an invalid mainnet invoice')
     }
     try {
-        decodeBolt11(invoice)
-    } catch {
+        const decoded = decodeBolt11(invoice)
+        const amountSection = decoded.sections.find(item => item?.name === 'amount')
+        if (typeof amountSection?.value !== 'string') {
+            fail('INVALID_MINT_QUOTE', 'The mint invoice must contain an amount')
+        }
+        if (BigInt(amountSection.value) !== BigInt(expectedAmount) * 1_000n) {
+            fail('INVALID_MINT_QUOTE', 'The mint invoice amount does not match the locked quote')
+        }
+    } catch (error) {
+        if (error instanceof SplitMintError) throw error
         fail('INVALID_MINT_QUOTE', 'The mint invoice could not be decoded')
     }
 }
@@ -164,6 +205,29 @@ function publicEvidence(
     }
 }
 
+function approvalPayloadFor(operation: MintOperation, storedWallet: StoredWallet): string {
+    const expiresAt = expiryNumber(operation.expiry)
+    if (
+        expiresAt === null
+        || !operation.invoiceSha256
+        || !operation.quoteSha256
+        || !operation.outputPlanSha256
+    ) {
+        fail('INVALID_OPERATION', 'The stored receive approval plan is incomplete')
+    }
+    return buildApprovalPayload({
+        operation: 'receive',
+        wallet_sha256: walletApprovalId(storedWallet.accessKey),
+        intent_id: operation.intentId,
+        amount: operation.amount,
+        max_spend: operation.amount,
+        expires_at: expiresAt,
+        invoice_sha256: operation.invoiceSha256,
+        quote_sha256: operation.quoteSha256,
+        plan_sha256: operation.outputPlanSha256,
+    })
+}
+
 function quoteMismatchFields(
     operation: MintOperation,
     quote: MintQuoteBolt11Response,
@@ -189,14 +253,18 @@ function quoteMismatchFields(
 }
 
 async function setUnknown(operation: MintOperation, code: string): Promise<MintOperation> {
-    return prisma.mintOperation.update({
-        where: { intentId: operation.intentId },
+    await prisma.mintOperation.updateMany({
+        where: {
+            intentId: operation.intentId,
+            state: { notIn: [MintOperationState.ISSUED, MintOperationState.EXPIRED] },
+        },
         data: {
             state: MintOperationState.UNKNOWN,
             errorCode: code,
             reconciledAt: new Date(),
         },
     })
+    return prisma.mintOperation.findUniqueOrThrow({ where: { intentId: operation.intentId } })
 }
 
 async function saveIssuedProofs(
@@ -210,6 +278,7 @@ async function saveIssuedProofs(
         const current = await tx.mintOperation.findUniqueOrThrow({
             where: { intentId: operation.intentId },
         })
+        if (current.state === MintOperationState.ISSUED) return current
         if (
             current.walletId !== operation.walletId
             || (
@@ -298,58 +367,59 @@ async function prepare(
     if (!Number.isSafeInteger(rawAmount) || rawAmount <= 0 || rawAmount > MAX_BOUNDARY_AMOUNT.toNumber()) {
         fail('AMOUNT_OUT_OF_RANGE', 'The receive amount is outside the supported integer range')
     }
-    const existing = await prisma.mintOperation.findUnique({ where: { intentId } })
-    if (existing) fail('DUPLICATE_INTENT', 'The receive intent already exists')
-
-    const [{ balance, pendingBalance }, activeReceives] = await Promise.all([
-        WalletService.getWalletBalance(storedWallet.id),
-        prisma.mintOperation.aggregate({
-            where: {
-                walletId: storedWallet.id,
-                state: {
-                    in: [
-                        MintOperationState.CREATING,
-                        MintOperationState.PREPARED,
-                        MintOperationState.PAID,
-                        MintOperationState.EXECUTING,
-                        MintOperationState.UNKNOWN,
-                    ],
-                },
-            },
-            _sum: { amount: true },
-        }),
-    ])
-    const reservedReceiveBalance = Amount.from(activeReceives._sum.amount ?? 0)
-    const effectiveMaxBalance = Amount.from(
-        storedWallet.maxBalance ?? process.env.MAX_BALANCE ?? MAX_BOUNDARY_AMOUNT,
-    )
-    if (
-        effectiveMaxBalance.lessThanOrEqual(Amount.zero())
-        || effectiveMaxBalance.greaterThan(MAX_BOUNDARY_AMOUNT)
-        || balance
-            .add(pendingBalance)
-            .add(reservedReceiveBalance)
-            .add(rawAmount)
-            .greaterThan(effectiveMaxBalance)
-    ) {
-        fail('BALANCE_LIMIT_EXCEEDED', 'The receive would exceed the reviewed balance boundary')
-    }
+    const maxBalance = effectiveMaxBalance(storedWallet)
 
     const { privkey, pubkey } = generateQuoteKey()
-    let operation = await prisma.mintOperation.create({
-        data: {
-            intentId,
-            walletId: storedWallet.id,
-            amount: rawAmount,
-            quotePrivkey: privkey,
-            quotePubkey: pubkey,
-            state: MintOperationState.CREATING,
-        },
-    })
+    let operation = await prisma.$transaction(async tx => {
+        const existing = await tx.mintOperation.findUnique({ where: { intentId } })
+        if (existing) fail('DUPLICATE_INTENT', 'The receive intent already exists')
+        const [available, pending, activeReceives] = await Promise.all([
+            tx.proof.aggregate({
+                where: { walletId: storedWallet.id, status: ProofStatus.UNSPENT },
+                _sum: { amount: true },
+            }),
+            tx.proof.aggregate({
+                where: { walletId: storedWallet.id, status: ProofStatus.PENDING },
+                _sum: { amount: true },
+            }),
+            tx.mintOperation.aggregate({
+                where: {
+                    walletId: storedWallet.id,
+                    state: {
+                        in: [
+                            MintOperationState.CREATING,
+                            MintOperationState.PREPARED,
+                            MintOperationState.PAID,
+                            MintOperationState.EXECUTING,
+                            MintOperationState.UNKNOWN,
+                        ],
+                    },
+                },
+                _sum: { amount: true },
+            }),
+        ])
+        const projected = Amount.from(available._sum.amount ?? 0)
+            .add(Amount.from(pending._sum.amount ?? 0))
+            .add(Amount.from(activeReceives._sum.amount ?? 0))
+            .add(rawAmount)
+        if (projected.greaterThan(maxBalance)) {
+            fail('BALANCE_LIMIT_EXCEEDED', 'The receive would exceed the reviewed balance boundary')
+        }
+        return tx.mintOperation.create({
+            data: {
+                intentId,
+                walletId: storedWallet.id,
+                amount: rawAmount,
+                quotePrivkey: privkey,
+                quotePubkey: pubkey,
+                state: MintOperationState.CREATING,
+            },
+        })
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable })
     try {
         const wallet = await WalletService.getWallet(storedWallet.mint)
         const quote = await wallet.createLockedMintQuote(rawAmount, pubkey)
-        validateInvoice(quote.request)
+        validateInvoice(quote.request, rawAmount)
         const now = Math.floor(Date.now() / 1_000)
         if (
             quote.quote.length === 0
@@ -398,7 +468,10 @@ async function prepare(
                 errorCode: null,
             },
         })
-        return publicEvidence(operation, MintQuoteState.UNPAID)
+        return {
+            ...publicEvidence(operation, MintQuoteState.UNPAID),
+            approval_payload: approvalPayloadFor(operation, storedWallet),
+        }
     } catch (error) {
         await setUnknown(operation, 'receive_prepare_unknown')
         throw error
@@ -495,6 +568,7 @@ async function execute(
     storedWallet: StoredWallet,
     intentId: string,
     hashes: ReceiveHashes,
+    approvalSignature: string,
 ): Promise<ReceiveEvidence> {
     if (!INTENT_ID.test(intentId)) fail('INVALID_INTENT_ID', 'The receive intent ID is invalid')
     if (Object.values(hashes).some(value => !HASH_HEX.test(value))) {
@@ -511,9 +585,36 @@ async function execute(
     ) {
         fail('APPROVAL_HASH_MISMATCH', 'The approved receive plan changed')
     }
+    try {
+        verifyApprovalSignature(approvalPayloadFor(operation, storedWallet), approvalSignature)
+    } catch (error) {
+        if (error instanceof ApprovalCapabilityError) fail(error.code, error.message)
+        fail('INVALID_APPROVAL', 'The approval signature could not be verified')
+    }
     const checked = await reconcile(operation, storedWallet)
     if (checked.state === MintOperationState.ISSUED) return checked
     operation = await prisma.mintOperation.findUniqueOrThrow({ where: { intentId } })
+    const expiresAt = expiryNumber(operation.expiry)
+    if (
+        operation.executionCount === 0
+        && expiresAt !== null
+        && expiresAt <= Math.floor(Date.now() / 1_000)
+    ) {
+        await prisma.mintOperation.updateMany({
+            where: {
+                intentId,
+                walletId: storedWallet.id,
+                state: { in: [MintOperationState.PREPARED, MintOperationState.PAID] },
+                executionCount: 0,
+            },
+            data: {
+                state: MintOperationState.EXPIRED,
+                errorCode: 'approval_expired',
+                reconciledAt: new Date(),
+            },
+        })
+        fail('APPROVAL_EXPIRED', 'The receive approval has expired')
+    }
     if (operation.state !== MintOperationState.PAID || operation.executionCount !== 0) {
         fail('QUOTE_NOT_PAID', 'The locked mint quote is not ready for one-shot issuance')
     }
@@ -549,7 +650,17 @@ async function status(storedWallet: StoredWallet, intentId: string): Promise<Rec
     if (!operation || operation.walletId !== storedWallet.id) {
         fail('OPERATION_NOT_FOUND', 'The prepared receive was not found')
     }
-    return reconcile(operation, storedWallet)
+    const evidence = await reconcile(operation, storedWallet)
+    if (
+        evidence.state === MintOperationState.PREPARED
+        || evidence.state === MintOperationState.PAID
+    ) {
+        return {
+            ...evidence,
+            approval_payload: approvalPayloadFor(operation, storedWallet),
+        }
+    }
+    return evidence
 }
 
 export const SplitMintService = {

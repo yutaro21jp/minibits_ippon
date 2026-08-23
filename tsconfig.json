@@ -3,6 +3,7 @@
     "target": "es2022",
     "module": "es2022",
     "moduleResolution": "Bundler",
+    "allowJs": true,
     "baseUrl": "./src",
 
     "outDir": "./dist",

@@ -23,6 +23,12 @@ import {
 import { decode as decodeBolt11 } from '@gandlaf21/bolt11-decode'
 import prisma from '../utils/prismaClient'
 import { WalletService } from './walletService'
+import {
+    ApprovalCapabilityError,
+    buildApprovalPayload,
+    verifyApprovalSignature,
+    walletApprovalId,
+} from './approvalCapability'
 
 const INTENT_ID = /^wallet_[0-9a-f]{24}$/
 const SHA256_HEX = /^[0-9a-f]{64}$/
@@ -46,6 +52,7 @@ type ReconciliationEvidence = {
     total_spent: number | null
     balance_after: number | null
     error_code: string | null
+    approval_payload?: string
 }
 
 type PaidReceipt = {
@@ -66,6 +73,7 @@ type PreparedPayment = ReconciliationEvidence & {
     invoice_sha256: string
     quote_sha256: string
     proof_plan_sha256: string
+    approval_payload: string
 }
 
 export class SplitMeltError extends Error {
@@ -150,6 +158,29 @@ function hashesFor(operation: MeltOperation): Hashes {
     }
 }
 
+function approvalPayloadFor(operation: MeltOperation, storedWallet: StoredWallet): string {
+    const hashes = hashesFor(operation)
+    return buildApprovalPayload({
+        operation: 'pay',
+        wallet_sha256: walletApprovalId(storedWallet.accessKey),
+        intent_id: operation.intentId,
+        amount: operation.amount,
+        max_spend: operation.maxSpend,
+        expires_at: expiryNumber(operation.expiry),
+        invoice_sha256: hashes.invoiceSha256,
+        quote_sha256: hashes.quoteSha256,
+        plan_sha256: hashes.proofPlanSha256,
+    })
+}
+
+function effectiveMaxPay(storedWallet: StoredWallet): number {
+    const configured = Number(process.env.MAX_PAY ?? 50_000)
+    if (!Number.isSafeInteger(configured) || configured <= 0) {
+        fail('INVALID_LIMIT_CONFIG', 'MAX_PAY must be a positive safe integer')
+    }
+    return storedWallet.maxPay === null ? configured : Math.min(storedWallet.maxPay, configured)
+}
+
 function restoredProofs(operation: MeltOperation): Proof[] {
     try {
         return deserializeProofs(JSON.parse(operation.selectedProofsJson) as string[])
@@ -225,14 +256,18 @@ function quoteMatches(operation: MeltOperation, quote: MeltQuoteBolt11Response):
 }
 
 async function setUnknown(operation: MeltOperation, code: string): Promise<MeltOperation> {
-    return prisma.meltOperation.update({
-        where: { intentId: operation.intentId },
+    await prisma.meltOperation.updateMany({
+        where: {
+            intentId: operation.intentId,
+            state: { notIn: [MeltOperationState.PAID, MeltOperationState.EXPIRED] },
+        },
         data: {
             state: MeltOperationState.UNKNOWN,
             errorCode: code,
             reconciledAt: new Date(),
         },
     })
+    return prisma.meltOperation.findUniqueOrThrow({ where: { intentId: operation.intentId } })
 }
 
 async function saveChangeProofs(
@@ -576,6 +611,10 @@ async function prepare(
     const feeReserve = boundaryNumber(quote.fee_reserve, 'fee reserve')
     const baseAmount = quote.amount.add(quote.fee_reserve)
     boundaryNumber(baseAmount, 'amount plus fee reserve')
+    const maxPay = effectiveMaxPay(storedWallet)
+    if (baseAmount.greaterThan(maxPay)) {
+        fail('PAYMENT_LIMIT_EXCEEDED', `The quote's maximum wallet spend exceeds the payment limit of ${maxPay}`)
+    }
 
     const available = await WalletService.loadProofs(storedWallet.id, ProofStatus.UNSPENT)
     let selected: Proof[]
@@ -587,6 +626,9 @@ async function prepare(
     if (selected.length === 0) fail('INSUFFICIENT_BALANCE', 'No suitable proof set is available')
     const inputFeeAmount = wallet.getFeesForProofs(selected)
     const maxSpendAmount = baseAmount.add(inputFeeAmount)
+    if (maxSpendAmount.greaterThan(maxPay)) {
+        fail('PAYMENT_LIMIT_EXCEEDED', `The prepared maximum wallet spend exceeds the payment limit of ${maxPay}`)
+    }
     const selectedTotal = sumProofs(selected)
     if (selectedTotal.lessThan(maxSpendAmount)) {
         fail('INSUFFICIENT_BALANCE', 'The selected proof set does not cover the maximum spend')
@@ -658,6 +700,7 @@ async function prepare(
         invoice_sha256: hashes.invoiceSha256,
         quote_sha256: hashes.quoteSha256,
         proof_plan_sha256: hashes.proofPlanSha256,
+        approval_payload: approvalPayloadFor(operation, storedWallet),
     }
 }
 
@@ -665,6 +708,7 @@ async function execute(
     storedWallet: StoredWallet,
     intentId: string,
     approved: Hashes,
+    approvalSignature: string,
 ): Promise<ReconciliationEvidence> {
     if (!INTENT_ID.test(intentId)) fail('INVALID_INTENT_ID', 'The payment intent ID is invalid')
     if (!SHA256_HEX.test(approved.invoiceSha256)
@@ -683,6 +727,12 @@ async function execute(
         || expected.proofPlanSha256 !== approved.proofPlanSha256
     ) {
         fail('APPROVAL_MISMATCH', 'The approved payment does not match the prepared operation')
+    }
+    try {
+        verifyApprovalSignature(approvalPayloadFor(operation, storedWallet), approvalSignature)
+    } catch (error) {
+        if (error instanceof ApprovalCapabilityError) fail(error.code, error.message)
+        fail('INVALID_APPROVAL', 'The approval signature could not be verified')
     }
     if (operation.state !== MeltOperationState.PREPARED || operation.executionCount !== 0) {
         fail('OPERATION_ALREADY_EXECUTED', 'The payment has already left the prepared state')
@@ -715,7 +765,10 @@ async function status(storedWallet: StoredWallet, intentId: string): Promise<Rec
             const expired = await expirePrepared(operation, restoredProofs(operation))
             return publicEvidence(expired)
         }
-        return publicEvidence(operation)
+        return {
+            ...publicEvidence(operation),
+            approval_payload: approvalPayloadFor(operation, storedWallet),
+        }
     }
     if (operation.state === MeltOperationState.EXPIRED) {
         return publicEvidence(operation)

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { FastifyInstance } from 'fastify'
-import { Amount, MintQuoteState, MeltQuoteState } from '@cashu/cashu-ts'
+import { Amount } from '@cashu/cashu-ts'
 
 // ── hoisted mock fns ──────────────────────────────────────────────────────────
 
@@ -117,6 +117,11 @@ async function get(app: FastifyInstance, url: string, headers: Record<string, st
     return app.inject({ method: 'GET', url, headers })
 }
 
+beforeEach(() => {
+    process.env.ENABLE_LEGACY_API_MUTATIONS = 'true'
+    process.env.TRUST_PROXY = 'false'
+})
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 describe('Authentication', () => {
@@ -176,52 +181,14 @@ describe('POST /v1/wallet/deposit', () => {
     beforeEach(async () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
-        mocks.getWalletBalance.mockResolvedValue({
-            balance: Amount.zero(),
-            pendingBalance: Amount.zero(),
-        })
-        mocks.createMintQuote.mockResolvedValue({
-            quote: 'quote-id-123',
-            request: 'lnbc...',
-            state: MintQuoteState.UNPAID,
-            expiry: 3600,
-        })
         app = await buildApp()
         await app.ready()
     })
 
-    it('creates a mint quote', async () => {
+    it('remains disabled even when the legacy opt-in variable is set', async () => {
         const res = await post(app, '/v1/wallet/deposit', { amount: 1000, unit: 'sat' })
-        expect(res.statusCode).toBe(200)
-        const body = res.json()
-        expect(body.quote).toBe('quote-id-123')
-        expect(mocks.createMintQuote).toHaveBeenCalledWith(1000, WALLET.mint)
-    })
-
-    it('rejects wrong unit', async () => {
-        const res = await post(app, '/v1/wallet/deposit', { amount: 1000, unit: 'msat' })
-        expect(res.statusCode).toBe(400)
-        expect(res.json().error.name).toBe('VALIDATION_ERROR')
-    })
-
-    it('rejects missing unit', async () => {
-        const res = await post(app, '/v1/wallet/deposit', { amount: 1000 })
-        expect(res.statusCode).toBe(400)
-    })
-
-    it('rejects zero amount', async () => {
-        const res = await post(app, '/v1/wallet/deposit', { amount: 0, unit: 'sat' })
-        expect(res.statusCode).toBe(400)
-    })
-
-    it('rejects deposit that would exceed max balance', async () => {
-        mocks.getWalletBalance.mockResolvedValue({
-            balance: Amount.from(99000),
-            pendingBalance: Amount.zero(),
-        })
-        const res = await post(app, '/v1/wallet/deposit', { amount: 5000, unit: 'sat' })
-        expect(res.statusCode).toBe(400)
-        expect(res.json().error.name).toBe('LIMIT_ERROR')
+        expect(res.statusCode).toBe(403)
+        expect(mocks.createMintQuote).not.toHaveBeenCalled()
     })
 })
 
@@ -235,84 +202,28 @@ describe('GET /v1/wallet/deposit/:quote', () => {
         await app.ready()
     })
 
-    it('returns quote status when unpaid', async () => {
-        mocks.checkMintQuote.mockResolvedValue({
-            quote: 'q1', request: 'lnbc...', state: MintQuoteState.UNPAID, expiry: 3600,
-        })
+    it('rejects raw quote status without querying or minting', async () => {
         const res = await get(app, '/v1/wallet/deposit/q1')
-        expect(res.statusCode).toBe(200)
-        expect(res.json().state).toBe(MintQuoteState.UNPAID)
+        expect(res.statusCode).toBe(403)
+        expect(mocks.checkMintQuote).not.toHaveBeenCalled()
         expect(mocks.mintProofs).not.toHaveBeenCalled()
-    })
-
-    it('mints proofs automatically when quote is paid', async () => {
-        mocks.checkMintQuote.mockResolvedValue({
-            quote: 'q1', request: 'lnbc...', state: MintQuoteState.PAID,
-            amount: Amount.from(1000), expiry: 3600,
-        })
-        mocks.mintProofs.mockResolvedValue([{ id: 'p1', amount: 1000, secret: 's1', C: 'C1' }])
-        const res = await get(app, '/v1/wallet/deposit/q1')
-        expect(res.statusCode).toBe(200)
-        expect(mocks.mintProofs.mock.calls[0][0].toNumber()).toBe(1000)
-        expect(mocks.mintProofs.mock.calls[0].slice(1)).toEqual(['q1', WALLET.mint])
-        expect(mocks.saveProofs).toHaveBeenCalled()
     })
 })
 
 describe('POST /v1/wallet/send', () => {
     let app: FastifyInstance
-    const SEND_PROOFS = [{ id: 'p1', amount: Amount.from(500), secret: 's1', C: 'C1' }]
 
     beforeEach(async () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
-        mocks.sendProofs.mockResolvedValue({ keep: [], send: SEND_PROOFS })
-        mocks.getProofsAmount.mockReturnValue(Amount.from(500))
         app = await buildApp()
         await app.ready()
     })
 
-    it('returns an encoded token', async () => {
+    it('never exports bearer ecash through the REST compatibility route', async () => {
         const res = await post(app, '/v1/wallet/send', { amount: 500, unit: 'sat' })
-        expect(res.statusCode).toBe(200)
-        const body = res.json()
-        expect(body.token).toBeTruthy()
-        expect(body.amount).toBe(500)
-        expect(body.unit).toBe('sat')
-    })
-
-    it('passes lock_to_pubkey as p2pk pubkey to sendProofs', async () => {
-        const pubkey66 = '02' + '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798'
-        const res = await post(app, '/v1/wallet/send', {
-            amount: 500, unit: 'sat', lock_to_pubkey: pubkey66,
-        })
-        expect(res.statusCode).toBe(200)
-        expect(mocks.sendProofs).toHaveBeenCalledWith(WALLET.id, 500, WALLET.mint, pubkey66)
-    })
-
-    it('rejects invalid lock_to_pubkey', async () => {
-        const res = await post(app, '/v1/wallet/send', {
-            amount: 500, unit: 'sat', lock_to_pubkey: 'notakey',
-        })
-        expect(res.statusCode).toBe(400)
-    })
-
-    it('rejects amount exceeding max send', async () => {
-        const res = await post(app, '/v1/wallet/send', { amount: 99999, unit: 'sat' })
-        expect(res.statusCode).toBe(400)
-        expect(res.json().error.name).toBe('LIMIT_ERROR')
-    })
-
-    it('rejects cashu_request (not implemented)', async () => {
-        const res = await post(app, '/v1/wallet/send', {
-            amount: 500, unit: 'sat', cashu_request: 'creqAbc',
-        })
-        expect(res.statusCode).toBe(400)
-    })
-
-    it('rejects wrong unit', async () => {
-        const res = await post(app, '/v1/wallet/send', { amount: 500, unit: 'msat' })
-        expect(res.statusCode).toBe(400)
+        expect(res.statusCode).toBe(403)
+        expect(mocks.sendProofs).not.toHaveBeenCalled()
     })
 })
 
@@ -322,28 +233,14 @@ describe('POST /v1/wallet/receive', () => {
     beforeEach(async () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
-        mocks.getWalletBalance.mockResolvedValue({
-            balance: Amount.zero(),
-            pendingBalance: Amount.zero(),
-        })
-        mocks.getTokenAmount.mockReturnValue(Amount.from(100))
-        mocks.getProofsAmount.mockReturnValue(Amount.from(100))
-        mocks.receiveToken.mockResolvedValue([])
         app = await buildApp()
         await app.ready()
     })
 
-    it('rejects missing token field', async () => {
-        const res = await post(app, '/v1/wallet/receive', {})
-        expect(res.statusCode).toBe(400)
-    })
-
-    it('checks the token amount before receiving it', async () => {
+    it('never imports bearer ecash through the REST compatibility route', async () => {
         const res = await post(app, '/v1/wallet/receive', { token: 'cashuBtest' })
-
-        expect(res.statusCode).toBe(200)
-        expect(mocks.getTokenAmount).toHaveBeenCalledWith('cashuBtest')
-        expect(mocks.receiveToken).toHaveBeenCalledWith(WALLET.id, 'cashuBtest', WALLET.mint)
+        expect(res.statusCode).toBe(403)
+        expect(mocks.receiveToken).not.toHaveBeenCalled()
     })
 })
 
@@ -380,69 +277,17 @@ describe('POST /v1/wallet/pay', () => {
     beforeEach(async () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
-        mocks.createMeltQuote.mockResolvedValue({
-            quote: 'melt-q1', amount: Amount.from(1000), fee_reserve: Amount.from(10),
-            state: MeltQuoteState.UNPAID, expiry: 3600,
-        })
-        mocks.meltProofs.mockResolvedValue({
-            quote: {
-                quote: 'melt-q1', amount: Amount.from(1000), fee_reserve: Amount.from(10),
-                state: MeltQuoteState.PAID, payment_preimage: 'preimage', expiry: 3600,
-            },
-            change: [],
-        })
         app = await buildApp()
         await app.ready()
     })
 
-    it('pays a bolt11 invoice', async () => {
+    it('remains disabled even when the legacy opt-in variable is set', async () => {
         const res = await post(app, '/v1/wallet/pay', {
             bolt11_request: 'lnbc10u...', amount: 1000, unit: 'sat',
         })
-        expect(res.statusCode).toBe(200)
-        const body = res.json()
-        expect(body.state).toBe(MeltQuoteState.PAID)
-        expect(body.payment_preimage).toBe('preimage')
-    })
-
-    it('rejects when neither bolt11 nor lightning address provided', async () => {
-        const res = await post(app, '/v1/wallet/pay', { amount: 1000, unit: 'sat' })
-        expect(res.statusCode).toBe(400)
-    })
-
-    it('rejects wrong unit', async () => {
-        const res = await post(app, '/v1/wallet/pay', {
-            bolt11_request: 'lnbc10u...', amount: 1000, unit: 'msat',
-        })
-        expect(res.statusCode).toBe(400)
-    })
-
-    it('rejects amount exceeding max pay', async () => {
-        const res = await post(app, '/v1/wallet/pay', {
-            bolt11_request: 'lnbc...', amount: 99999, unit: 'sat',
-        })
-        expect(res.statusCode).toBe(400)
-        expect(res.json().error.name).toBe('LIMIT_ERROR')
-    })
-
-    it('resolves lightning address to bolt11 and pays', async () => {
-        const mockFetch = vi.fn()
-            .mockResolvedValueOnce({
-                json: () => Promise.resolve({
-                    callback: 'https://example.com/callback',
-                    minSendable: 1000, maxSendable: 1000000,
-                }),
-            })
-            .mockResolvedValueOnce({
-                json: () => Promise.resolve({ pr: 'lnbc10u_from_lnurl' }),
-            })
-        vi.stubGlobal('fetch', mockFetch)
-
-        const res = await post(app, '/v1/wallet/pay', {
-            lightning_address: 'user@example.com', amount: 1000, unit: 'sat',
-        })
-        expect(res.statusCode).toBe(200)
-        expect(mocks.createMeltQuote).toHaveBeenCalledWith('lnbc10u_from_lnurl', WALLET.mint)
+        expect(res.statusCode).toBe(403)
+        expect(mocks.createMeltQuote).not.toHaveBeenCalled()
+        expect(mocks.meltProofs).not.toHaveBeenCalled()
     })
 })
 
@@ -452,18 +297,14 @@ describe('GET /v1/wallet/pay/:quote', () => {
     beforeEach(async () => {
         vi.clearAllMocks()
         mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
-        mocks.checkMeltQuote.mockResolvedValue({
-            quote: 'melt-q1', amount: Amount.from(1000), fee_reserve: Amount.from(10),
-            state: MeltQuoteState.PAID, payment_preimage: 'pi', expiry: 3600,
-        })
         app = await buildApp()
         await app.ready()
     })
 
-    it('returns melt quote status', async () => {
+    it('rejects raw quote status without querying the mint', async () => {
         const res = await get(app, '/v1/wallet/pay/melt-q1')
-        expect(res.statusCode).toBe(200)
-        expect(res.json().state).toBe(MeltQuoteState.PAID)
+        expect(res.statusCode).toBe(403)
+        expect(mocks.checkMeltQuote).not.toHaveBeenCalled()
     })
 })
 

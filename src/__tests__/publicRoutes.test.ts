@@ -57,6 +57,11 @@ vi.mock('../services/walletService', () => ({
 
 import { buildApp } from '../app'
 
+beforeEach(() => {
+    process.env.ENABLE_LEGACY_API_MUTATIONS = 'true'
+    process.env.TRUST_PROXY = 'false'
+})
+
 // ── fixtures ────────────────────────────────────────────────────────────────
 
 const CREATED_WALLET = {
@@ -92,6 +97,11 @@ describe('GET /v1/info', () => {
         expect(body.limits.max_balance).toBe(100000)
         expect(body.limits.max_send).toBe(50000)
         expect(body.limits.max_pay).toBe(50000)
+        expect(body.features).toEqual({
+            signed_cli_approval: true,
+            legacy_api_mutations: false,
+            lightning_address_resolution: false,
+        })
     })
 })
 
@@ -123,71 +133,39 @@ describe('POST /v1/wallet', () => {
         expect(mocks.receiveToken).not.toHaveBeenCalled()
     })
 
-    it('creates a wallet and receives initial token', async () => {
-        const mockProofs = [{ id: 'p1', amount: 100, secret: 'sec1', C: 'C1' }]
-        mocks.receiveToken.mockResolvedValue(mockProofs)
-        mocks.getTokenAmount.mockReturnValue(Amount.from(100))
-        mocks.getProofsAmount.mockReturnValue(Amount.from(100))
-
+    it('clamps requested wallet limits to the operator limits', async () => {
         const res = await app.inject({
             method: 'POST',
             url: '/v1/wallet',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ name: 'funded-wallet', token: 'cashuBtest' }),
+            body: JSON.stringify({
+                limits: { max_balance: 999_999, max_send: 99_999, max_pay: 80_000 },
+            }),
         })
 
         expect(res.statusCode).toBe(200)
-        const body = res.json()
-        expect(body.balance).toBe(100)
-        expect(mocks.receiveToken).toHaveBeenCalledWith(CREATED_WALLET.id, 'cashuBtest', CREATED_WALLET.mint)
+        expect(mocks.prismaWalletCreate).toHaveBeenCalledWith({
+            data: expect.objectContaining({
+                maxBalance: 100_000,
+                maxSend: 50_000,
+                maxPay: 50_000,
+            }),
+        })
     })
 
-    it('rejects token that exceeds max balance', async () => {
-        const bigProofs = [{ id: 'p1', amount: 999999, secret: 'sec1', C: 'C1' }]
-        mocks.receiveToken.mockResolvedValue(bigProofs)
-        mocks.getTokenAmount.mockReturnValue(Amount.from(999999))
-
+    it('permanently rejects initial token import before creating a wallet', async () => {
+        process.env.ENABLE_LEGACY_API_MUTATIONS = 'true'
         const res = await app.inject({
             method: 'POST',
             url: '/v1/wallet',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ token: 'cashuBbig' }),
+            body: JSON.stringify({ token: 'cashuBtest' }),
         })
 
-        expect(res.statusCode).toBe(400)
-        expect(res.json().error.name).toBe('LIMIT_ERROR')
-        expect(mocks.prismaProofDeleteMany).toHaveBeenCalledWith({ where: { walletId: CREATED_WALLET.id } })
-        expect(mocks.prismaWalletDelete).toHaveBeenCalled()
-    })
-
-    it('cleans up wallet if token receive fails', async () => {
-        mocks.receiveToken.mockRejectedValue(new Error('invalid token'))
-
-        const res = await app.inject({
-            method: 'POST',
-            url: '/v1/wallet',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ token: 'cashuBbad' }),
-        })
-
-        expect(res.statusCode).toBe(400)
-        expect(mocks.prismaProofDeleteMany).toHaveBeenCalledWith({ where: { walletId: CREATED_WALLET.id } })
-        expect(mocks.prismaWalletDelete).toHaveBeenCalledWith({ where: { id: CREATED_WALLET.id } })
-    })
-
-    it('cleans up wallet if initial token metadata is invalid', async () => {
-        mocks.getTokenAmount.mockImplementationOnce(() => { throw new Error('invalid token metadata') })
-
-        const res = await app.inject({
-            method: 'POST',
-            url: '/v1/wallet',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ token: 'cashuBinvalid' }),
-        })
-
-        expect(res.statusCode).toBe(400)
-        expect(mocks.prismaProofDeleteMany).toHaveBeenCalledWith({ where: { walletId: CREATED_WALLET.id } })
-        expect(mocks.prismaWalletDelete).toHaveBeenCalledWith({ where: { id: CREATED_WALLET.id } })
+        expect(res.statusCode).toBe(403)
+        expect(mocks.prismaWalletCreate).not.toHaveBeenCalled()
         expect(mocks.receiveToken).not.toHaveBeenCalled()
+        expect(mocks.prismaProofDeleteMany).not.toHaveBeenCalled()
+        expect(mocks.prismaWalletDelete).not.toHaveBeenCalled()
     })
 })

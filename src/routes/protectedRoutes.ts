@@ -2,10 +2,7 @@ import 'dotenv/config'
 import { Wallet as PrismaWallet } from '@prisma/client'
 import { FastifyRequest, FastifyPluginCallback, FastifyReply } from 'fastify'
 import {
-    MintQuoteState,
-    MeltQuoteState,
     getTokenMetadata,
-    getEncodedToken,
     CheckStateEnum,
     decodePaymentRequest,
 } from '@cashu/cashu-ts'
@@ -13,7 +10,6 @@ import { decode as bolt11Decode } from '@gandlaf21/bolt11-decode'
 import { bearerAuthHandler } from '../handlers/bearerAuth'
 import { log } from '../services/logService'
 import { WalletService } from '../services/walletService'
-import { NostrService } from '../services/nostrService'
 import { getExchangeRate, isSupportedCurrency } from '../services/exchangeRateService'
 import AppError, { Err } from '../utils/AppError'
 import {
@@ -63,23 +59,13 @@ function getAuthWallet(req: FastifyRequest): PrismaWallet {
 }
 
 
-// Helper to resolve the effective limit (per-wallet overrides global)
-function effectiveLimit(walletLimit: number | null, globalEnvKey: string, fallback: number): number {
-    const global = parseInt(process.env[globalEnvKey] || String(fallback))
-    if (walletLimit !== null && walletLimit !== undefined) {
-        return Math.min(walletLimit, global)
-    }
-    return global
-}
-
-
-function validateUnit(wallet: PrismaWallet, unit: string | undefined, caller: string, reqId: string) {
-    if (!unit) {
-        throw new AppError(400, Err.VALIDATION_ERROR, 'Unit is required', { caller, reqId })
-    }
-    if (unit !== wallet.unit) {
-        throw new AppError(400, Err.VALIDATION_ERROR, `Unit '${unit}' does not match wallet unit '${wallet.unit}'`, { caller, reqId })
-    }
+function rejectUnsafeMutation(caller: string, reqId: string): never {
+    throw new AppError(
+        403,
+        Err.UNAUTHORIZED_ERROR,
+        'One-step REST wallet mutations are permanently disabled; use the signed local prepare/execute/status flow',
+        { caller, reqId },
+    )
 }
 
 
@@ -151,7 +137,7 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
     // POST /v1/wallet/deposit
     instance.post('/wallet/deposit', {
         schema: {
-            description: 'Request a Lightning invoice to fund the wallet. The wallet automatically handles the mint quote and ecash issuance once the invoice is paid.',
+            description: 'Disabled in this fork. Use the signed local receive prepare/execute/status flow.',
             tags: ['Deposit'],
             security: BEARER,
             body: {
@@ -167,39 +153,14 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
             },
         },
     }, async (req: WalletDepositRequest, res: FastifyReply): Promise<WalletDepositResponse> => {
-        const wallet = getAuthWallet(req)
-        const { amount, unit } = req.body
-
-        validateUnit(wallet, unit, 'Deposit', req.id)
-
-        if (!amount || amount <= 0) {
-            throw new AppError(400, Err.VALIDATION_ERROR, 'Amount must be a positive integer', { caller: 'Deposit', reqId: req.id })
-        }
-
-        const maxBalance = effectiveLimit(wallet.maxBalance, 'MAX_BALANCE', 100000)
-        const { balance } = await WalletService.getWalletBalance(wallet.id)
-
-        if (balance.add(amount).greaterThan(maxBalance)) {
-            throw new AppError(400, Err.LIMIT_ERROR, `Deposit would exceed max balance of ${maxBalance}`, { caller: 'Deposit', reqId: req.id })
-        }
-
-        const quote = await WalletService.createMintQuote(amount, wallet.mint)
-
-        log.info('POST /v1/wallet/deposit', { walletId: wallet.id, amount, reqId: req.id })
-
-        return {
-            quote: quote.quote,
-            request: quote.request,
-            state: quote.state,
-            expiry: quote.expiry,
-        }
+        return rejectUnsafeMutation('Deposit', req.id)
     })
 
 
     // GET /v1/wallet/deposit/:quote
     instance.get('/wallet/deposit/:quote', {
         schema: {
-            description: 'Check deposit status. Automatically mints ecash when the invoice is paid.',
+            description: 'Disabled because raw mint quote IDs are not wallet-bound. Use signed local receive-status.',
             tags: ['Deposit'],
             security: BEARER,
             params: {
@@ -211,45 +172,14 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
             },
         },
     }, async (req: DepositCheckRequest, res: FastifyReply): Promise<WalletDepositResponse> => {
-        const wallet = getAuthWallet(req)
-        const { quote: quoteId } = req.params
-
-        const quote = await WalletService.checkMintQuote(quoteId, wallet.mint)
-
-        // If paid, mint the proofs automatically
-        if (quote.state === MintQuoteState.PAID) {
-            try {
-                const proofs = await WalletService.mintProofs(quote.amount, quote.quote, wallet.mint)
-                await WalletService.saveProofs(wallet.id, proofs)
-
-                log.info('GET /v1/wallet/deposit/:quote - Minted proofs', {
-                    walletId: wallet.id,
-                    amount: quote.amount.toString(),
-                    reqId: req.id,
-                })
-            } catch (e: any) {
-                log.warn('GET /v1/wallet/deposit/:quote - Mint proofs failed', {
-                    error: e.message,
-                    reqId: req.id,
-                })
-            }
-        }
-
-        log.info('GET /v1/wallet/deposit/:quote', { walletId: wallet.id, state: quote.state, reqId: req.id })
-
-        return {
-            quote: quote.quote,
-            request: quote.request,
-            state: quote.state,
-            expiry: quote.expiry,
-        }
+        return rejectUnsafeMutation('DepositCheck', req.id)
     })
 
 
     // POST /v1/wallet/send
     instance.post('/wallet/send', {
         schema: {
-            description: 'Export an ecash token for a specified amount. The wallet handles all necessary proof swaps and marks sent proofs as pending to prevent double-spending. Mint fees are paid by the sender. Optionally lock the token to a recipient pubkey (NUT-11 P2PK).',
+            description: 'Disabled until ecash export has a durable signed approval and recovery model.',
             tags: ['Send'],
             security: BEARER,
             body: {
@@ -276,46 +206,7 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
             },
         },
     }, async (req: WalletSendRequest, res: FastifyReply): Promise<WalletSendResponse> => {
-        const wallet = getAuthWallet(req)
-        const { amount, unit, memo, lock_to_pubkey, cashu_request } = req.body
-
-        validateUnit(wallet, unit, 'Send', req.id)
-
-        if (cashu_request) {
-            throw new AppError(400, Err.VALIDATION_ERROR, 'Paying of cashu payment requests is not yet supported.', { caller: 'Send', reqId: req.id })
-        }
-
-        if (!amount || amount <= 0) {
-            throw new AppError(400, Err.VALIDATION_ERROR, 'Amount must be a positive integer', { caller: 'Send', reqId: req.id })
-        }
-
-        const maxSend = effectiveLimit(wallet.maxSend, 'MAX_SEND', 50000)
-        if (amount > maxSend) {
-            throw new AppError(400, Err.LIMIT_ERROR, `Amount ${amount} exceeds max send limit of ${maxSend}`, { caller: 'Send', reqId: req.id })
-        }
-
-        let p2pkPubkey: string | undefined
-        if (lock_to_pubkey) {
-            p2pkPubkey = NostrService.normalizePubkey(lock_to_pubkey)
-        }
-
-        const { send } = await WalletService.sendProofs(wallet.id, amount, wallet.mint, p2pkPubkey)
-
-        const token = getEncodedToken({
-            mint: wallet.mint,
-            proofs: send,
-            memo,
-            unit: wallet.unit,
-        })
-
-        log.info('POST /v1/wallet/send', { walletId: wallet.id, amount, reqId: req.id })
-
-        return {
-            token,
-            amount: WalletService.getProofsAmount(send).toNumber(),
-            unit: wallet.unit,
-            memo,
-        }
+        return rejectUnsafeMutation('Send', req.id)
     })
 
 
@@ -488,7 +379,7 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
     // POST /v1/wallet/pay
     instance.post('/wallet/pay', {
         schema: {
-            description: "Pay a BOLT11 Lightning invoice or Lightning address using the wallet's ecash balance. The wallet handles the melt quote, fees, and returns any change.",
+            description: 'Disabled in this fork. Use signed local pay-prepare/pay-execute/pay-status.',
             tags: ['Pay'],
             security: BEARER,
             body: {
@@ -496,7 +387,7 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
                 required: ['amount', 'unit'],
                 properties: {
                     bolt11_request:    { type: 'string', description: 'BOLT11 invoice to pay' },
-                    lightning_address: { type: 'string', description: 'Lightning address (e.g. user@domain.com)' },
+                    lightning_address: { type: 'string', description: 'Rejected in this fork; resolve to BOLT11 in a trusted client' },
                     amount:            { type: 'integer' },
                     unit:              { type: 'string', enum: ['sat', 'msat'] },
                 },
@@ -506,80 +397,14 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
             },
         },
     }, async (req: WalletPayRequest, res: FastifyReply): Promise<WalletPayResponse> => {
-        const wallet = getAuthWallet(req)
-        const { bolt11_request, lightning_address, amount, unit } = req.body
-
-        validateUnit(wallet, unit, 'Pay', req.id)
-
-        if (!bolt11_request && !lightning_address) {
-            throw new AppError(400, Err.VALIDATION_ERROR, 'Either bolt11_request or lightning_address is required', { caller: 'Pay', reqId: req.id })
-        }
-
-        const maxPay = effectiveLimit(wallet.maxPay, 'MAX_PAY', 50000)
-        if (amount && amount > maxPay) {
-            throw new AppError(400, Err.LIMIT_ERROR, `Amount ${amount} exceeds max pay limit of ${maxPay}`, { caller: 'Pay', reqId: req.id })
-        }
-
-        let invoice = bolt11_request
-
-        // Resolve lightning address to bolt11 invoice
-        if (lightning_address && !invoice) {
-            try {
-                const [name, domain] = lightning_address.split('@')
-                const lnurlResponse = await fetch(`https://${domain}/.well-known/lnurlp/${name}`)
-                const lnurlData = await lnurlResponse.json() as any
-
-                if (lnurlData.status === 'ERROR') {
-                    throw new Error(lnurlData.reason || 'LNURL error')
-                }
-
-                const amountMsat = amount * 1000
-                const callbackUrl = new URL(lnurlData.callback)
-                callbackUrl.searchParams.set('amount', String(amountMsat))
-
-                const invoiceResponse = await fetch(callbackUrl.toString())
-                const invoiceData = await invoiceResponse.json() as any
-
-                if (invoiceData.status === 'ERROR') {
-                    throw new Error(invoiceData.reason || 'Failed to get invoice from lightning address')
-                }
-
-                invoice = invoiceData.pr
-            } catch (e: any) {
-                throw new AppError(400, Err.CONNECTION_ERROR, `Failed to resolve lightning address: ${e.message}`, { caller: 'Pay', reqId: req.id })
-            }
-        }
-
-        if (!invoice) {
-            throw new AppError(400, Err.VALIDATION_ERROR, 'Could not resolve a bolt11 invoice', { caller: 'Pay', reqId: req.id })
-        }
-
-        const meltQuote = await WalletService.createMeltQuote(invoice, wallet.mint)
-        const meltResponse = await WalletService.meltProofs(wallet.id, meltQuote, wallet.mint)
-
-        log.info('POST /v1/wallet/pay', {
-            walletId: wallet.id,
-            amount: meltResponse.quote.amount.toString(),
-            fee: meltResponse.quote.fee_reserve.toString(),
-            state: meltResponse.quote.state,
-            reqId: req.id,
-        })
-
-        return {
-            quote: meltResponse.quote.quote,
-            amount: meltResponse.quote.amount.toNumber(),
-            fee_reserve: meltResponse.quote.fee_reserve.toNumber(),
-            state: meltResponse.quote.state,
-            payment_preimage: meltResponse.quote.payment_preimage,
-            expiry: meltResponse.quote.expiry,
-        }
+        return rejectUnsafeMutation('Pay', req.id)
     })
 
 
     // GET /v1/wallet/pay/:quote
     instance.get('/wallet/pay/:quote', {
         schema: {
-            description: 'Check the status of a melt quote / payment operation (e.g., whether the invoice was successfully paid).',
+            description: 'Disabled because raw melt quote IDs are not wallet-bound. Use signed local pay-status.',
             tags: ['Pay'],
             security: BEARER,
             params: {
@@ -591,28 +416,14 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
             },
         },
     }, async (req: PayCheckRequest, res: FastifyReply): Promise<WalletPayResponse> => {
-        const wallet = getAuthWallet(req)
-        const { quote: quoteId } = req.params
-
-        const quote = await WalletService.checkMeltQuote(quoteId, wallet.mint)
-
-        log.info('GET /v1/wallet/pay/:quote', { walletId: wallet.id, state: quote.state, reqId: req.id })
-
-        return {
-            quote: quote.quote,
-            amount: quote.amount.toNumber(),
-            fee_reserve: quote.fee_reserve.toNumber(),
-            state: quote.state,
-            payment_preimage: quote.payment_preimage,
-            expiry: quote.expiry,
-        }
+        return rejectUnsafeMutation('PayCheck', req.id)
     })
 
 
     // POST /v1/wallet/receive
     instance.post('/wallet/receive', {
         schema: {
-            description: 'Import an external Cashu token. The wallet validates the token with the mint and swaps it for a fresh ecash token.',
+            description: 'Disabled until token import has a durable signed approval and ambiguity-safe recovery model.',
             tags: ['Receive'],
             security: BEARER,
             body: {
@@ -635,35 +446,7 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
             },
         },
     }, async (req: WalletReceiveRequest, res: FastifyReply): Promise<WalletReceiveResponse> => {
-        const wallet = getAuthWallet(req)
-        const { token: tokenStr } = req.body
-
-        if (!tokenStr) {
-            throw new AppError(400, Err.VALIDATION_ERROR, 'Token is required', { caller: 'Receive', reqId: req.id })
-        }
-
-        const maxBalance = effectiveLimit(wallet.maxBalance, 'MAX_BALANCE', 100000)
-        const { balance: currentBalance } = await WalletService.getWalletBalance(wallet.id)
-
-        // Decode token to check amount before receiving
-        const tokenAmount = WalletService.getTokenAmount(tokenStr)
-
-        if (currentBalance.add(tokenAmount).greaterThan(maxBalance)) {
-            throw new AppError(400, Err.LIMIT_ERROR, `Receiving ${tokenAmount.toString()} would exceed max balance of ${maxBalance}`, { caller: 'Receive', reqId: req.id })
-        }
-
-        const newProofs = await WalletService.receiveToken(wallet.id, tokenStr, wallet.mint)
-        const amount = WalletService.getProofsAmount(newProofs)
-        const { balance, pendingBalance } = await WalletService.getWalletBalance(wallet.id)
-
-        log.info('POST /v1/wallet/receive', { walletId: wallet.id, amount, reqId: req.id })
-
-        return {
-            amount: amount.toNumber(),
-            unit: wallet.unit,
-            balance: balance.toNumber(),
-            pending_balance: pendingBalance.toNumber(),
-        }
+        return rejectUnsafeMutation('Receive', req.id)
     })
 
 

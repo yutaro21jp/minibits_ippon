@@ -28,6 +28,11 @@ export interface InfoResponse {
     unit:   string
     mints:  string[]
     limits: InfoLimits
+    features: {
+        signed_cli_approval: boolean
+        legacy_api_mutations: boolean
+        lightning_address_resolution: boolean
+    }
 }
 
 // ── POST /v1/wallet (create) · GET /v1/wallet ────────────────────────────────

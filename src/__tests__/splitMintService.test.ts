@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import crypto from 'crypto'
 import { Amount, MintQuoteState, OutputData } from '@cashu/cashu-ts'
 import { MintOperationState, ProofStatus } from '@prisma/client'
 
@@ -6,8 +7,10 @@ const INTENT_ID = 'wallet_0123456789abcdef01234567'
 const INVOICE = 'lnbc1lockedtestinvoice'
 const QUOTE_ID = 'private-locked-quote'
 const NOW = 2_000_000_000
+const approvalKeys = crypto.generateKeyPairSync('ed25519')
 
 const mocks = vi.hoisted(() => ({
+    decodeBolt11: vi.fn(),
     getWallet: vi.fn(),
     getWalletBalance: vi.fn(),
     proofStorageData: vi.fn(),
@@ -31,7 +34,7 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('@gandlaf21/bolt11-decode', () => ({
-    decode: vi.fn(() => ({ paymentRequest: INVOICE, sections: [], route_hints: [] })),
+    decode: mocks.decodeBolt11,
 }))
 
 vi.mock('../services/walletService', () => ({
@@ -104,6 +107,20 @@ function hashes(prepared: Awaited<ReturnType<typeof SplitMintService.prepare>>) 
     }
 }
 
+function signature(prepared: Awaited<ReturnType<typeof SplitMintService.prepare>>): string {
+    return crypto.sign(
+        null,
+        Buffer.from(prepared.approval_payload!, 'utf8'),
+        approvalKeys.privateKey,
+    ).toString('base64url')
+}
+
+function executePrepared(
+    prepared: Awaited<ReturnType<typeof SplitMintService.prepare>>,
+) {
+    return SplitMintService.execute(storedWallet, INTENT_ID, hashes(prepared), signature(prepared))
+}
+
 describe('SplitMintService', () => {
     let operation: any
     const storedProofs = new Map<string, any>()
@@ -122,6 +139,15 @@ describe('SplitMintService', () => {
         vi.spyOn(Date, 'now').mockReturnValue(NOW * 1_000)
         operation = null
         storedProofs.clear()
+        delete process.env.MAX_BALANCE
+        process.env.IPPON_APPROVAL_PUBLIC_KEY = approvalKeys.publicKey
+            .export({ format: 'der', type: 'spki' })
+            .toString('base64url')
+        mocks.decodeBolt11.mockReturnValue({
+            paymentRequest: INVOICE,
+            sections: [{ name: 'amount', value: '64000' }],
+            route_hints: [],
+        })
 
         mocks.getWallet.mockResolvedValue(wallet)
         mocks.getWalletBalance.mockResolvedValue({
@@ -186,6 +212,24 @@ describe('SplitMintService', () => {
             return operation
         })
         mocks.mintOperationUpdateMany.mockImplementation(async ({ where, data }: any) => {
+            if (where.state?.notIn) {
+                if (!operation || where.state.notIn.includes(operation.state)) return { count: 0 }
+                operation = { ...operation, ...data, updatedAt: new Date() }
+                return { count: 1 }
+            }
+            if (where.state?.in) {
+                if (
+                    !operation
+                    || operation.intentId !== where.intentId
+                    || operation.walletId !== where.walletId
+                    || !where.state.in.includes(operation.state)
+                    || operation.executionCount !== where.executionCount
+                ) {
+                    return { count: 0 }
+                }
+                operation = { ...operation, ...data, updatedAt: new Date() }
+                return { count: 1 }
+            }
             if (
                 !operation
                 || operation.intentId !== where.intentId
@@ -232,8 +276,11 @@ describe('SplitMintService', () => {
         }))
         mocks.transaction.mockImplementation(async (callback: any) => callback({
             mintOperation: {
+                findUnique: mocks.mintOperationFindUnique,
                 findUniqueOrThrow: mocks.mintOperationFindUniqueOrThrow,
+                create: mocks.mintOperationCreate,
                 update: mocks.mintOperationUpdate,
+                aggregate: mocks.mintOperationAggregate,
             },
             proof: {
                 findUnique: mocks.proofFindUnique,
@@ -279,11 +326,21 @@ describe('SplitMintService', () => {
         expect(mocks.completeMint).not.toHaveBeenCalled()
     })
 
-    it('rejects a receive that would cross the reviewed balance boundary', async () => {
-        mocks.getWalletBalance.mockResolvedValueOnce({
-            balance: Amount.from(2_147_483_647),
-            pendingBalance: Amount.zero(),
+    it('rejects a locked quote whose BOLT11 amount differs from the requested amount', async () => {
+        mocks.decodeBolt11.mockReturnValueOnce({
+            paymentRequest: INVOICE,
+            sections: [{ name: 'amount', value: '65000' }],
+            route_hints: [],
         })
+
+        await expect(SplitMintService.prepare(storedWallet, INTENT_ID, 64))
+            .rejects.toMatchObject({ code: 'INVALID_MINT_QUOTE' })
+        expect(operation.state).toBe(MintOperationState.UNKNOWN)
+        expect(mocks.prepareMint).not.toHaveBeenCalled()
+    })
+
+    it('rejects a receive that would cross the reviewed balance boundary', async () => {
+        mocks.proofAggregate.mockResolvedValueOnce({ _sum: { amount: 2_147_483_647 } })
 
         await expect(SplitMintService.prepare(storedWallet, INTENT_ID, 1))
             .rejects.toMatchObject({ code: 'BALANCE_LIMIT_EXCEEDED' })
@@ -306,9 +363,22 @@ describe('SplitMintService', () => {
         expect(operation).toBeNull()
     })
 
+    it('clamps a stored wallet balance limit to the global operator limit', async () => {
+        process.env.MAX_BALANCE = '100'
+
+        await expect(SplitMintService.prepare(
+            { ...storedWallet, maxBalance: 1_000 },
+            INTENT_ID,
+            101,
+        )).rejects.toMatchObject({ code: 'BALANCE_LIMIT_EXCEEDED' })
+
+        expect(mocks.createLockedMintQuote).not.toHaveBeenCalled()
+        expect(operation).toBeNull()
+    })
+
     it('issues once, stores proofs atomically, and clears bearer recovery material', async () => {
         const prepared = await SplitMintService.prepare(storedWallet, INTENT_ID, 64)
-        const result = await SplitMintService.execute(storedWallet, INTENT_ID, hashes(prepared))
+        const result = await executePrepared(prepared)
 
         expect(result).toMatchObject({
             state: MintOperationState.ISSUED,
@@ -331,7 +401,7 @@ describe('SplitMintService', () => {
         const prepared = await SplitMintService.prepare(storedWallet, INTENT_ID, 64)
         mocks.completeMint.mockRejectedValueOnce(new Error('response lost'))
 
-        const unknown = await SplitMintService.execute(storedWallet, INTENT_ID, hashes(prepared))
+        const unknown = await executePrepared(prepared)
         expect(unknown).toMatchObject({
             state: MintOperationState.UNKNOWN,
             quote_state: MintQuoteState.PAID,
@@ -342,6 +412,18 @@ describe('SplitMintService', () => {
         expect(afterRestart.state).toBe(MintOperationState.UNKNOWN)
         expect(operation.executionCount).toBe(1)
         expect(mocks.completeMint).toHaveBeenCalledTimes(1)
+    })
+
+    it('rejects an approved receive after its signed expiry without minting', async () => {
+        const prepared = await SplitMintService.prepare(storedWallet, INTENT_ID, 64)
+        vi.spyOn(Date, 'now').mockReturnValue((NOW + 3_601) * 1_000)
+
+        await expect(executePrepared(prepared))
+            .rejects.toMatchObject({ code: 'APPROVAL_EXPIRED' })
+
+        expect(operation.state).toBe(MintOperationState.EXPIRED)
+        expect(operation.executionCount).toBe(0)
+        expect(mocks.completeMint).not.toHaveBeenCalled()
     })
 
     it('accepts status with optional NUT-20 pubkey and expiry omitted', async () => {
@@ -407,7 +489,7 @@ describe('SplitMintService', () => {
         })
         vi.spyOn(OutputData.prototype, 'toProof').mockReturnValueOnce(issuedProof as any)
 
-        const recovered = await SplitMintService.execute(storedWallet, INTENT_ID, hashes(prepared))
+        const recovered = await executePrepared(prepared)
 
         expect(recovered.state).toBe(MintOperationState.ISSUED)
         expect(mocks.restore).toHaveBeenCalledTimes(1)

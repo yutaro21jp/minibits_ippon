@@ -23,11 +23,24 @@ const limitsSchema = {
     },
 }
 
-// receiveToken persists successful swap batches immediately. If a later batch
-// fails, remove child proofs before discarding the just-created wallet row.
-async function discardWallet(walletId: number) {
-    await prisma.proof.deleteMany({ where: { walletId } })
-    await prisma.wallet.delete({ where: { id: walletId } })
+function configuredLimit(envKey: string, fallback: number): number {
+    const value = Number(process.env[envKey] ?? fallback)
+    if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new AppError(500, Err.SERVER_ERROR, `${envKey} must be a positive safe integer`, {
+            caller: 'CreateWallet',
+        })
+    }
+    return value
+}
+
+function walletLimit(requested: number | undefined, global: number, field: string): number | null {
+    if (requested === undefined) return null
+    if (!Number.isSafeInteger(requested) || requested <= 0) {
+        throw new AppError(400, Err.VALIDATION_ERROR, `${field} must be a positive safe integer`, {
+            caller: 'CreateWallet',
+        })
+    }
+    return Math.min(requested, global)
 }
 
 export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
@@ -47,6 +60,14 @@ export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
                         unit:   { type: 'string', enum: ['sat', 'msat'] },
                         mints:  { type: 'array', items: { type: 'string' }, description: 'List of supported Cashu mint URLs' },
                         limits: limitsSchema,
+                        features: {
+                            type: 'object',
+                            properties: {
+                                signed_cli_approval: { type: 'boolean' },
+                                legacy_api_mutations: { type: 'boolean' },
+                                lightning_address_resolution: { type: 'boolean' },
+                            },
+                        },
                     },
                 },
             },
@@ -70,6 +91,11 @@ export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
                 rate_limit_create_wallet_max: parseInt(process.env.RATE_LIMIT_CREATE_WALLET_MAX || '3'),
                 rate_limit_window:            process.env.RATE_LIMIT_WINDOW || '1 minute',
             },
+            features: {
+                signed_cli_approval: true,
+                legacy_api_mutations: false,
+                lightning_address_resolution: false,
+            },
         }
     })
 
@@ -77,13 +103,13 @@ export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
     // POST /v1/wallet
     instance.post('/wallet', {
         schema: {
-            description: 'Create a new short-lived wallet. Optionally specify a supported mint URL (defaults to the first configured mint), provide a name, wallet-level limits, and an initial Cashu token to fund it immediately.',
+            description: 'Create a new short-lived wallet. Optionally specify a supported mint URL (defaults to the first configured mint), a name, and wallet-level limits. Initial token import is rejected; use the signed local receive flow.',
             tags: ['Wallet'],
             body: {
                 type: 'object',
                 properties: {
                     name:     { type: 'string', description: 'Optional label for the wallet' },
-                    token:    { type: 'string', description: 'Optional Cashu token (cashuB...) to deposit on creation' },
+                    token:    { type: 'string', description: 'Rejected in this fork; use the signed local receive flow' },
                     mint_url: { type: 'string', description: 'Mint URL to bind this wallet to. Must be one of the supported mints. Defaults to the first configured mint.' },
                     limits: {
                         type: 'object',
@@ -129,6 +155,15 @@ export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
         const { name, token, mint_url, limits } = req.body || {}
         const unit = process.env.UNIT || 'sat'
 
+        if (token) {
+            throw new AppError(
+                403,
+                Err.UNAUTHORIZED_ERROR,
+                'Initial token import is permanently disabled; create the wallet first and use the signed local receive flow',
+                { caller: 'CreateWallet', reqId: req.id },
+            )
+        }
+
         const mintUrls = WalletService.getMintUrls()
         if (mintUrls.length === 0) {
             throw new AppError(500, Err.VALIDATION_ERROR, 'No supported mints configured on this server', { caller: 'CreateWallet' })
@@ -140,6 +175,9 @@ export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
         }
 
         const accessKey = crypto.randomBytes(32).toString('hex')
+        const maxBalance = configuredLimit('MAX_BALANCE', 100_000)
+        const maxSend = configuredLimit('MAX_SEND', 50_000)
+        const maxPay = configuredLimit('MAX_PAY', 50_000)
 
         const wallet = await prisma.wallet.create({
             data: {
@@ -147,32 +185,11 @@ export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
                 name:       name || null,
                 mint:       resolvedMintUrl,
                 unit,
-                maxBalance: limits?.max_balance ?? null,
-                maxSend:    limits?.max_send    ?? null,
-                maxPay:     limits?.max_pay     ?? null,
+                maxBalance: walletLimit(limits?.max_balance, maxBalance, 'limits.max_balance'),
+                maxSend:    walletLimit(limits?.max_send, maxSend, 'limits.max_send'),
+                maxPay:     walletLimit(limits?.max_pay, maxPay, 'limits.max_pay'),
             },
         })
-
-        let balance = 0
-        let pendingBalance = 0
-
-        // If a token was provided, receive it immediately
-        if (token) {
-            try {
-                const maxBalance = wallet.maxBalance ?? parseInt(process.env.MAX_BALANCE || '100000')
-                const tokenAmount = WalletService.getTokenAmount(token)
-                if (tokenAmount.greaterThan(maxBalance)) {
-                    throw new AppError(400, Err.LIMIT_ERROR, `Token amount ${tokenAmount.toString()} exceeds max balance ${maxBalance}`, { caller: 'CreateWallet' })
-                }
-
-                const newProofs = await WalletService.receiveToken(wallet.id, token, resolvedMintUrl)
-                balance = WalletService.getProofsAmount(newProofs).toNumber()
-            } catch (e: any) {
-                await discardWallet(wallet.id)
-                if (e instanceof AppError) throw e
-                throw new AppError(400, Err.VALIDATION_ERROR, `Failed to receive initial token: ${e.message}`, { caller: 'CreateWallet' })
-            }
-        }
 
         log.info('POST /v1/wallet', { walletId: wallet.id, name, mint: resolvedMintUrl, hasToken: !!token, reqId: req.id })
 
@@ -185,8 +202,8 @@ export const publicRoutes: FastifyPluginCallback = (instance, opts, done) => {
             access_key:      wallet.accessKey,
             mint:            wallet.mint,
             unit:            wallet.unit,
-            balance,
-            pending_balance: pendingBalance,
+            balance: 0,
+            pending_balance: 0,
             limits:          walletLimits,
         }
     })

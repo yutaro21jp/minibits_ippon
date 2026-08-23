@@ -24,8 +24,14 @@ will be acknowledged and triaged as maintainer availability permits.
 
 ## Scope reminders
 
-- The approval-gated split payment and receive adapters cover local CLI mode,
-  not the REST API.
+- The signed approval-gated split payment and receive adapters cover local CLI
+  mode, not the REST API. The signer private key must be isolated from both the
+  wallet and proposing agent.
+- One-step REST value mutations, raw quote-status routes, and initial token
+  import are permanently disabled. There is no compatibility flag that can
+  bypass the signed local workflow.
+- Server-side Lightning-address resolution is disabled. Resolve addresses in a
+  trusted client and submit the resulting BOLT11 invoice.
 - A timed-out payment or issuance must be reconciled with status commands; it
   must never be blindly retried.
 - The opt-in regtest must use loopback FakeWallet mints and disposable data.

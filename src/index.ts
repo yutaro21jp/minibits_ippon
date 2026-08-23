@@ -34,7 +34,16 @@ function resolvedSqlitePath(): string {
 
 function maskedDbUrl(): string {
     const url = process.env.DATABASE_URL || ''
-    return url.replace(/:[^:@/]*@/, ':***@')
+    try {
+        const parsed = new URL(url)
+        parsed.username = ''
+        parsed.password = ''
+        parsed.search = ''
+        parsed.hash = ''
+        return parsed.toString()
+    } catch {
+        return '[redacted invalid database URL]'
+    }
 }
 
 const dbInfo = dbEngine === 'sqlite'

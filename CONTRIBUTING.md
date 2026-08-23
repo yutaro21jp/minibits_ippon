@@ -20,8 +20,7 @@ local wallets.
 Run the complete standard check set before opening a pull request:
 
 ```bash
-yarn test
-yarn build
+yarn run verify
 git diff --check
 ```
 
@@ -36,6 +35,8 @@ limits documented in the README; never substitute a public mint or real sats.
   changing wallet operations.
 - Preserve fail-closed behavior: an unknown external result is reconciled, not
   retried.
+- Preserve the signer boundary: wallet/agent runtimes receive only the approval
+  public key, never the signing private key.
 - Update public documentation when a command or response contract changes.
 - Sign off commits with `git commit --signoff` to certify the Developer
   Certificate of Origin.

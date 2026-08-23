@@ -3,7 +3,6 @@ import readline from 'readline'
 import crypto from 'crypto'
 import {
     getTokenMetadata,
-    getEncodedToken,
     decodePaymentRequest,
 } from '@cashu/cashu-ts'
 import { decode as bolt11Decode } from '@gandlaf21/bolt11-decode'
@@ -11,16 +10,13 @@ import prisma from './utils/prismaClient'
 import { WalletService } from './services/walletService'
 import { SplitMeltError, SplitMeltService } from './services/splitMeltService'
 import { SplitMintError, SplitMintService } from './services/splitMintService'
-import { NostrService } from './services/nostrService'
 import { log } from './services/logService'
+import { approvalKeyConfigured } from './services/approvalCapability'
 
 // ── Key helpers ───────────────────────────────────────────────────────────────
 
-const KEY_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789'
-
-function generateShortKey(): string {
-    const bytes = crypto.randomBytes(6)
-    return Array.from(bytes, b => KEY_CHARS[b % KEY_CHARS.length]).join('')
+function generateAccessKey(): string {
+    return crypto.randomBytes(32).toString('hex')
 }
 
 // Display short (6-char) keys as xxx-xxx; leave full hex keys as-is.
@@ -59,12 +55,10 @@ async function handleCommand(parts: string[]): Promise<void> {
                 'wallet list',
                 'wallet <key> balance',
                 'wallet <key> receive-prepare <intent_id> <amount>',
-                'wallet <key> receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256>',
+                'wallet <key> receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256> <approval_signature>',
                 'wallet <key> receive-status <intent_id>',
-                'wallet <key> send <amount> [lock_pubkey]',
-                'wallet <key> receive <token>',
                 'wallet <key> pay-prepare <intent_id> <bolt11>',
-                'wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>',
+                'wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256> <approval_signature>',
                 'wallet <key> pay-status <intent_id>',
                 'wallet <key> sync',
                 'decode <cashu_token_or_bolt11_or_cashu_request>',
@@ -85,8 +79,13 @@ async function handleCommand(parts: string[]): Promise<void> {
                 max_send:    parseInt(process.env.MAX_SEND    || '50000'),
                 max_pay:     parseInt(process.env.MAX_PAY     || '50000'),
             },
+            approval: {
+                scheme: 'ed25519-v1',
+                required: true,
+                public_key_configured: approvalKeyConfigured(),
+            },
             payment_adapter: {
-                protocol_version: 5,
+                protocol_version: 6,
                 cashu_ts_version: '4.7.2',
                 split_melt: true,
                 persistent_operations: true,
@@ -96,7 +95,7 @@ async function handleCommand(parts: string[]): Promise<void> {
                 non_reserving_prepare: true,
             },
             receive_adapter: {
-                protocol_version: 1,
+                protocol_version: 2,
                 cashu_ts_version: '4.7.2',
                 nut20_locked_quotes: true,
                 unique_quote_keys: true,
@@ -198,7 +197,7 @@ async function handleCommand(parts: string[]): Promise<void> {
                     return
                 }
 
-                const accessKey = generateShortKey()
+                const accessKey = generateAccessKey()
                 const wallet = await prisma.wallet.create({
                     data: { accessKey, name, mint, unit },
                 })
@@ -301,12 +300,12 @@ async function handleCommand(parts: string[]): Promise<void> {
             return
         }
 
-        // receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256>
+        // receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256> <approval_signature>
         if (op === 'receive-execute') {
-            const [intentId, invoiceSha256, quoteSha256, outputPlanSha256] = parts.slice(3, 7)
-            if (!intentId || !invoiceSha256 || !quoteSha256 || !outputPlanSha256) {
+            const [intentId, invoiceSha256, quoteSha256, outputPlanSha256, approvalSignature] = parts.slice(3, 8)
+            if (!intentId || !invoiceSha256 || !quoteSha256 || !outputPlanSha256 || !approvalSignature) {
                 cliError(
-                    'Usage: wallet <key> receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256>',
+                    'Usage: wallet <key> receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256> <approval_signature>',
                     'VALIDATION_ERROR',
                 )
                 return
@@ -316,7 +315,7 @@ async function handleCommand(parts: string[]): Promise<void> {
                     invoiceSha256,
                     quoteSha256,
                     outputPlanSha256,
-                }))
+                }, approvalSignature))
             } catch (e: any) {
                 cliError(e.message, e instanceof SplitMintError ? e.code : 'RECEIVE_EXECUTE_ERROR')
             }
@@ -338,35 +337,15 @@ async function handleCommand(parts: string[]): Promise<void> {
             return
         }
 
-        // send <amount> [lock_pubkey]
+        // One-shot ecash export has no durable prepare/approve/reconcile boundary.
         if (op === 'send') {
-            const amount = parseInt(parts[3])
-            if (!amount || amount <= 0) { cliError('Usage: wallet <key> send <amount> [lock_pubkey]'); return }
-            try {
-                let p2pkPubkey: string | undefined
-                if (parts[4]) p2pkPubkey = NostrService.normalizePubkey(parts[4])
-                const { send } = await WalletService.sendProofs(wallet.id, amount, wallet.mint, p2pkPubkey)
-                const token = getEncodedToken({ mint: wallet.mint, proofs: send, unit: wallet.unit })
-                out({ token, amount: WalletService.getProofsAmount(send).toNumber(), unit: wallet.unit })
-            } catch (e: any) { cliError(e.message) }
+            cliError('One-shot send is disabled until it has an approval-bound operation model', 'UNSAFE_OPERATION')
             return
         }
 
-        // receive <token>
+        // One-shot token import can leave an ambiguous result after a network fault.
         if (op === 'receive') {
-            const tokenStr = parts[3]
-            if (!tokenStr) { cliError('Usage: wallet <key> receive <token>'); return }
-            try {
-                const newProofs = await WalletService.receiveToken(wallet.id, tokenStr, wallet.mint)
-                const amount = WalletService.getProofsAmount(newProofs)
-                const { balance, pendingBalance } = await WalletService.getWalletBalance(wallet.id)
-                out({
-                    amount: amount.toNumber(),
-                    unit: wallet.unit,
-                    balance: balance.toNumber(),
-                    pending_balance: pendingBalance.toNumber(),
-                })
-            } catch (e: any) { cliError(e.message) }
+            cliError('One-shot token receive is disabled until it has a durable recovery model', 'UNSAFE_OPERATION')
             return
         }
 
@@ -402,12 +381,12 @@ async function handleCommand(parts: string[]): Promise<void> {
             return
         }
 
-        // pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>
+        // pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256> <approval_signature>
         if (op === 'pay-execute') {
-            const [intentId, invoiceSha256, quoteSha256, proofPlanSha256] = parts.slice(3, 7)
-            if (!intentId || !invoiceSha256 || !quoteSha256 || !proofPlanSha256) {
+            const [intentId, invoiceSha256, quoteSha256, proofPlanSha256, approvalSignature] = parts.slice(3, 8)
+            if (!intentId || !invoiceSha256 || !quoteSha256 || !proofPlanSha256 || !approvalSignature) {
                 cliError(
-                    'Usage: wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>',
+                    'Usage: wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256> <approval_signature>',
                     'VALIDATION_ERROR',
                 )
                 return
@@ -417,7 +396,7 @@ async function handleCommand(parts: string[]): Promise<void> {
                     invoiceSha256,
                     quoteSha256,
                     proofPlanSha256,
-                }))
+                }, approvalSignature))
             } catch (e: any) {
                 cliError(e.message, e instanceof SplitMeltError ? e.code : 'PAYMENT_EXECUTE_ERROR')
             }
@@ -472,8 +451,8 @@ export function startCli(): Promise<void> {
         process.stderr.write('Minibits Ippon CLI — type "help" for commands, "exit" to quit\n')
         if (interactive) rl.prompt()
 
-        // Track the in-flight async handler so the 'close' handler can await it.
-        let currentOp: Promise<void> | null = null
+        // Serialize stdin commands so piped callers cannot race wallet mutations.
+        let currentOp: Promise<void> = Promise.resolve()
         let closing = false
 
         rl.on('line', (line: string) => {
@@ -491,21 +470,21 @@ export function startCli(): Promise<void> {
             }
 
             const parts = trimmed.split(/\s+/)
-            currentOp = (async () => {
+            currentOp = currentOp.then(async () => {
                 try {
                     await handleCommand(parts)
                 } catch (e: any) {
                     cliError(e.message)
                 }
                 if (!closing && interactive) rl.prompt()
-            })()
+            })
         })
 
         rl.on('close', () => {
             closing = true
             // Await the in-flight operation (if any) before disconnecting.
             const cleanup = async () => {
-                if (currentOp) await currentOp
+                await currentOp
                 await prisma.$disconnect()
                 resolve()
             }

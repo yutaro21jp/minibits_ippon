@@ -15,6 +15,10 @@ const RECEIVE_FAKE_SATS = 2
 const PROCESS_TIMEOUT_MS = 45_000
 const MAX_STATUS_ATTEMPTS = 15
 const DATABASE_ENGINE = (process.env.IPPON_REGTEST_DATABASE_ENGINE || 'sqlite').toLowerCase()
+const approvalKeys = crypto.generateKeyPairSync('ed25519')
+const approvalPublicKey = approvalKeys.publicKey
+    .export({ type: 'spki', format: 'der' })
+    .toString('base64url')
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const appPath = path.join(root, 'dist', 'index.js')
@@ -38,6 +42,15 @@ function requireCondition(condition, code) {
 
 function delay(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds))
+}
+
+function approvalSignature(prepared) {
+    requireCondition(typeof prepared?.approval_payload === 'string', 'approval_payload_missing')
+    return crypto.sign(
+        null,
+        Buffer.from(prepared.approval_payload, 'utf8'),
+        approvalKeys.privateKey,
+    ).toString('base64url')
 }
 
 async function runProcess(executable, args, { env, input, label }) {
@@ -108,6 +121,7 @@ function cliEnvironment(context, mode) {
         MAX_BALANCE: '512',
         MAX_SEND: '32',
         MAX_PAY: '32',
+        IPPON_APPROVAL_PUBLIC_KEY: approvalPublicKey,
         LOG_LEVEL: 'error',
         IPPON_REGTEST_FAULT_ACK: ACKNOWLEDGEMENT,
         IPPON_REGTEST_FAULT_STATE_PATH: context.faultStatePath,
@@ -395,7 +409,7 @@ async function fundDisposableWallet(context) {
         lastStatus = status
         if (status.state === 'PAID') {
             const issued = await runCliSuccess(
-                `wallet ${created.access_key} receive-execute ${intentId} ${prepared.invoice_sha256} ${prepared.quote_sha256} ${prepared.output_plan_sha256}`,
+                `wallet ${created.access_key} receive-execute ${intentId} ${prepared.invoice_sha256} ${prepared.quote_sha256} ${prepared.output_plan_sha256} ${approvalSignature(prepared)}`,
                 { ...context, label: 'source_locked_funding_mint' },
             )
             requireCondition(issued.state === 'ISSUED', 'source_fake_funding_not_issued')
@@ -581,7 +595,7 @@ async function main() {
         }
 
         const tampered = await runCli(
-            `wallet ${sourceAccessKey} pay-execute ${intentId} ${changedHash(prepared.invoice_sha256)} ${prepared.quote_sha256} ${prepared.proof_plan_sha256}`,
+            `wallet ${sourceAccessKey} pay-execute ${intentId} ${changedHash(prepared.invoice_sha256)} ${prepared.quote_sha256} ${prepared.proof_plan_sha256} ${approvalSignature(prepared)}`,
             { ...context, label: 'tampered_approval' },
         )
         requireCondition(tampered?.error === true, 'tampered_approval_was_accepted')
@@ -595,7 +609,7 @@ async function main() {
         requireCondition(faultState.melt_posts === 0, 'tamper_reached_melt_endpoint')
 
         const unknown = await runCliSuccess(
-            `wallet ${sourceAccessKey} pay-execute ${intentId} ${prepared.invoice_sha256} ${prepared.quote_sha256} ${prepared.proof_plan_sha256}`,
+            `wallet ${sourceAccessKey} pay-execute ${intentId} ${prepared.invoice_sha256} ${prepared.quote_sha256} ${prepared.proof_plan_sha256} ${approvalSignature(prepared)}`,
             { ...context, label: 'lost_response_execute' },
             'drop-melt-and-block-reconcile',
         )
@@ -747,7 +761,7 @@ async function main() {
         faultState = await readFaultState(faultStatePath)
         const mintPostsBeforeExecute = faultState.mint_posts
         const tamperedReceive = await runCli(
-            `wallet ${sourceAccessKey} receive-execute ${receiveIntentId} ${changedHash(receivePrepared.invoice_sha256)} ${receivePrepared.quote_sha256} ${receivePrepared.output_plan_sha256}`,
+            `wallet ${sourceAccessKey} receive-execute ${receiveIntentId} ${changedHash(receivePrepared.invoice_sha256)} ${receivePrepared.quote_sha256} ${receivePrepared.output_plan_sha256} ${approvalSignature(receivePrepared)}`,
             { ...context, label: 'tampered_receive_approval' },
         )
         requireCondition(tamperedReceive?.error === true, 'tampered_receive_was_accepted')
@@ -762,7 +776,7 @@ async function main() {
         )
 
         const unknownReceive = await runCliSuccess(
-            `wallet ${sourceAccessKey} receive-execute ${receiveIntentId} ${receivePrepared.invoice_sha256} ${receivePrepared.quote_sha256} ${receivePrepared.output_plan_sha256}`,
+            `wallet ${sourceAccessKey} receive-execute ${receiveIntentId} ${receivePrepared.invoice_sha256} ${receivePrepared.quote_sha256} ${receivePrepared.output_plan_sha256} ${approvalSignature(receivePrepared)}`,
             { ...context, label: 'lost_mint_response_execute' },
             'drop-mint-and-block-reconcile',
         )
@@ -838,7 +852,7 @@ async function main() {
                 { ...context, label: 'postgres_concurrent_payment_prepare' },
             )
             const requestCountsBeforePayConcurrency = await readRequestCounts(requestLogPath)
-            const concurrentPayCommand = `wallet ${sourceAccessKey} pay-execute ${concurrentPayIntentId} ${concurrentPayPrepared.invoice_sha256} ${concurrentPayPrepared.quote_sha256} ${concurrentPayPrepared.proof_plan_sha256}`
+            const concurrentPayCommand = `wallet ${sourceAccessKey} pay-execute ${concurrentPayIntentId} ${concurrentPayPrepared.invoice_sha256} ${concurrentPayPrepared.quote_sha256} ${concurrentPayPrepared.proof_plan_sha256} ${approvalSignature(concurrentPayPrepared)}`
             const concurrentPayResults = await Promise.all([
                 runCli(concurrentPayCommand, {
                     ...context,
@@ -893,7 +907,7 @@ async function main() {
                 `postgres_concurrent_receive_not_paid_${lastConcurrentReceiveStatus?.state || 'missing'}`,
             )
             const requestCountsBeforeReceiveConcurrency = await readRequestCounts(requestLogPath)
-            const concurrentReceiveCommand = `wallet ${sourceAccessKey} receive-execute ${concurrentReceiveIntentId} ${concurrentReceivePrepared.invoice_sha256} ${concurrentReceivePrepared.quote_sha256} ${concurrentReceivePrepared.output_plan_sha256}`
+            const concurrentReceiveCommand = `wallet ${sourceAccessKey} receive-execute ${concurrentReceiveIntentId} ${concurrentReceivePrepared.invoice_sha256} ${concurrentReceivePrepared.quote_sha256} ${concurrentReceivePrepared.output_plan_sha256} ${approvalSignature(concurrentReceivePrepared)}`
             const concurrentReceiveResults = await Promise.all([
                 runCli(concurrentReceiveCommand, {
                     ...context,

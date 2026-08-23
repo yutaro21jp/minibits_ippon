@@ -16,22 +16,27 @@ send ecash and pay Lightning invoices. This fork adds a safer local-CLI payment
 boundary for systems that must not pay immediately when an invoice arrives:
 
 1. `pay-prepare` obtains the Cashu melt quote, selects proofs without reserving them, and
-   returns the amount, fee ceiling, maximum spend, planned proof
-   total, minimum change, expiry, payment hash, and approval hashes. It does not
-   pay.
+   returns the amount, fee ceiling, maximum spend, planned proof total, minimum
+   change, expiry, payment hash, approval hashes, and a canonical
+   `approval_payload`. It does not pay.
 2. An external application can show those values to a person or apply its own
    approval policy without receiving the raw quote ID or proofs.
-3. `pay-execute` accepts only the unchanged approval hashes, atomically reserves
-   the exact approved proofs, and attempts the payment once.
-4. `pay-status` reconciles PENDING or UNKNOWN outcomes after a timeout or
+3. A separate trusted signer reviews and signs that exact payload with Ed25519.
+   The wallet has only the public key, so the proposing agent cannot approve its
+   own proposal.
+4. `pay-execute` accepts only the unchanged approval hashes and detached
+   signature, atomically reserves the exact approved proofs, and attempts the
+   payment once.
+5. `pay-status` reconciles PENDING or UNKNOWN outcomes after a timeout or
    restart. It never retries the melt.
 
 Incoming Lightning uses the same split boundary. `receive-prepare` creates a
 NUT-20 quote locked to a fresh secp256k1 key, prepares signed blinded outputs,
 and keeps the quote ID, private key, and output secrets in the Ippon database.
 `receive-status` checks payment state without minting. Once paid,
-`receive-execute` accepts only the approved hashes and submits the mint request
-at most once; an ambiguous issued result is recovered with NUT-09 restore.
+`receive-execute` accepts only the approved hashes plus an Ed25519 capability
+and submits the mint request at most once; an ambiguous issued result is
+recovered with NUT-09 restore.
 
 This is useful for an AI assistant proposing a small purchase, an expense bot
 waiting for an owner, or any service that wants to avoid blind retries and
@@ -40,8 +45,9 @@ directly; a product embeds it as its wallet engine and supplies the approval UI.
 
 ### Current safety boundary
 
-- The split payment flow is implemented only for local CLI mode. The REST API
-  remains outside this approval adapter.
+- The signed split payment and receive flows are implemented only for local CLI
+  mode. Legacy REST mutations are outside this approval adapter and permanently
+  disabled; `GET` wallet/info/decode/check/rate functionality remains available.
 - The split receive flow is also local-CLI-only. Unlocked `deposit` and raw
   `deposit-check` commands are disabled in this fork.
 - cashu-ts is pinned to 4.7.2 and amounts stay native until database, REST, or
@@ -50,6 +56,10 @@ directly; a product embeds it as its wallet engine and supplies the approval UI.
   database. Approval responses expose only hashes and bounded amounts. The
   maximum economic spend is kept separate from the proof total temporarily
   handed to the mint; any excess is covered by persisted NUT-08 change outputs.
+- Execution requires a detached Ed25519 signature over a wallet-, intent-,
+  amount-, expiry-, quote-, invoice-, and plan-bound payload. Only the public
+  key is configured in Ippon; see
+  [`docs/APPROVAL_PROTOCOL.md`](docs/APPROVAL_PROTOCOL.md).
 - The full mocked test suite and build pass, including restart, proof
   reservation, preimage verification, locked-quote issuance, NUT-09 restore,
   and ambiguous-outcome tests.
@@ -70,10 +80,10 @@ directly; a product embeds it as its wallet engine and supplies the approval UI.
 
 | Surface | Current behavior in this fork |
 |---|---|
-| REST API | The upstream REST behavior remains available and does not use the split approval adapters. |
-| Local CLI ecash send/receive | The inherited one-step `send` and token `receive` commands remain available. |
-| Local CLI Lightning payment | One-step `pay` and raw-ID `pay-check` are disabled; use `pay-prepare`, external approval, `pay-execute`, and `pay-status`. |
-| Local CLI Lightning receive | Unlocked `deposit` and raw-ID `deposit-check` are disabled; use `receive-prepare`, external approval, `receive-execute`, and `receive-status`. |
+| REST API | Read-only/inspection routes remain available. One-step deposit/send/pay/receive and raw quote-status routes, plus initial token import, are permanently disabled in this fork. |
+| Local CLI ecash send/receive | Inherited one-step `send` and token `receive` are disabled until they have durable approval/recovery models. |
+| Local CLI Lightning payment | One-step `pay` and raw-ID `pay-check` are disabled; use `pay-prepare`, a detached Ed25519 approval, `pay-execute`, and `pay-status`. |
+| Local CLI Lightning receive | Unlocked `deposit` and raw-ID `deposit-check` are disabled; use `receive-prepare`, a detached Ed25519 approval, `receive-execute`, and `receive-status`. |
 | Local SQLite storage | The parent directory must be mode `0700`, the database must be `0600`, and symbolic-link traversal is rejected. |
 
 ### Opt-in local regtest fault drill
@@ -133,6 +143,8 @@ relationship to the original project and the fork's modifications.
 
 - Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
 - Report security issues privately as described in [`SECURITY.md`](SECURITY.md).
+- Review the latest hardening scope and residual boundaries in
+  [`docs/SECURITY_REVIEW_2026-08-23.md`](docs/SECURITY_REVIEW_2026-08-23.md).
 - Standard CI runs the complete mocked test suite (including private SQLite
   path checks) and the build. The acknowledged two-mint regtest remains an
   opt-in local test because it starts loopback services and requires a separate
@@ -191,7 +203,14 @@ Due to the above constraints, the primary safeguard is a combination of rate lim
 
 ## Server mode - REST API
 
-The API isto be used in server-side deployments and is versioned under `/v1/`, using standard HTTP methods with JSON payloads.  
+> [!WARNING]
+> This fork permanently rejects inherited one-step REST value mutations, raw
+> quote-status operations, and initial token import. The endpoint reference
+> below documents the inherited shape only; those handlers return `403`. Use the
+> signed local CLI prepare/execute/status flows for Lightning value movement.
+> Server-side Lightning-address resolution is also disabled.
+
+The read-only API can be used in server-side deployments and is versioned under `/v1/`, using standard HTTP methods with JSON payloads.
 All authenticated endpoints require a `Bearer access_key` in the `Authorization` header (except wallet creation and public info).
 
 ### GET /v1/info
@@ -319,7 +338,7 @@ curl -X POST http://localhost:3001/v1/wallet/decode \
 
 ### POST /v1/wallet/pay
 
-Pays an external Lightning invoice (or Lightning address) using the wallet's ecash balance. The wallet handles melt quote, fees, and returns any change.
+Pays an external BOLT11 Lightning invoice using the wallet's ecash balance. Lightning addresses must be resolved by a trusted client; the wallet handles the melt quote, fees, and change.
 
 | Authorization          | Request Type     | Response Type      |
 |------------------------|------------------|--------------------|
@@ -400,7 +419,9 @@ CLI mode is intended for **local, self-hosted use** — typically by an AI agent
 - `INTERACTION_MODE=cli` — starts a readline REPL instead of an HTTP server.
 - `DATABASE_ENGINE=sqlite` — stores data in a local file (`DATABASE_FILE_PATH`, default `~/.ippon/database.sqlite`).
 - **All responses are JSON lines on stdout**; the prompt (`> `) and info messages go to stderr so they don't interfere with programmatic parsing.
-- Wallet access keys are short 6-character alphanumeric strings displayed as `xxx-xxx` (e.g. `adg-08m`). Both formats (`adg08m` and `adg-08m`) are accepted as input.
+- New wallet access keys are 256-bit random hex strings. Six-character keys
+  created by older versions remain readable for migration, but new wallets no
+  longer create weak cross-mode bearer credentials.
 
 ### Quick start
 
@@ -436,13 +457,13 @@ All commands are typed at the `> ` prompt (or piped via stdin). Every response i
 | `wallet <key> balance` | Show wallet balance and details; auto-syncs pending proofs with the mint first |
 | `wallet <key> deposit <amount>` | Disabled: unlocked mint quotes are unsafe for remote approval |
 | `wallet <key> deposit-check <quote_id>` | Disabled: raw quote IDs stay inside Ippon |
-| `wallet <key> send <amount> [lock_pubkey]` | Export a Cashu token (optionally P2PK-locked) |
-| `wallet <key> receive <token>` | Import a Cashu token |
+| `wallet <key> send ...` | Disabled until ecash export has an approval-bound durable operation model |
+| `wallet <key> receive ...` | Disabled until token import has an ambiguity-safe durable recovery model |
 | `wallet <key> pay-prepare <intent_id> <bolt11>` | Create and persist a quote, fixed proof plan, and change recovery data without paying |
-| `wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256>` | Execute the approved, unchanged plan once |
+| `wallet <key> pay-execute <intent_id> <invoice_sha256> <quote_sha256> <proof_plan_sha256> <approval_signature>` | Verify the Ed25519 capability and execute the unchanged plan once |
 | `wallet <key> pay-status <intent_id>` | Reconcile quote and proof states without retrying the melt |
 | `wallet <key> receive-prepare <intent_id> <amount>` | Create one NUT-20 locked quote and persist its signed output plan |
-| `wallet <key> receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256>` | Mint the approved paid quote at most once |
+| `wallet <key> receive-execute <intent_id> <invoice_sha256> <quote_sha256> <output_plan_sha256> <approval_signature>` | Verify the Ed25519 capability and mint the approved paid quote at most once |
 | `wallet <key> receive-status <intent_id>` | Reconcile the quote and recover issued outputs without retrying mint |
 | `wallet <key> sync` | Sync pending proofs with the mint |
 | `restore-audit <mint_url>` | Check every proof for one allowlisted mint in a restored DB against NUT-07 without changing wallet state or exposing the access key |
@@ -454,31 +475,32 @@ All commands are typed at the `> ` prompt (or piped via stdin). Every response i
 
 ```
 > wallet create agent-session-1
-{"access_key":"adg-08m","name":"agent-session-1","mint":"https://mint.minibits.cash/Bitcoin","unit":"sat","balance":0,"pending_balance":0}
+{"access_key":"<64-hex-access-key>","name":"agent-session-1","mint":"https://mint.minibits.cash/Bitcoin","unit":"sat","balance":0,"pending_balance":0}
 
-> wallet adg-08m receive-prepare wallet_89abcdef0123456789abcdef 100
-{"intent_id":"wallet_89abcdef0123456789abcdef","state":"PREPARED","quote_state":"UNPAID","amount":100,"request":"lnbc1000n...","expiry":1234567890,"invoice_sha256":"...","quote_sha256":"...","output_plan_sha256":"...","proofs_issued":0,"balance":null,"error_code":null}
+> wallet <key> receive-prepare wallet_89abcdef0123456789abcdef 100
+{"intent_id":"wallet_89abcdef0123456789abcdef","state":"PREPARED","amount":100,"expiry":2000003600,"invoice_sha256":"...","quote_sha256":"...","output_plan_sha256":"...","approval_payload":"{...}"}
 
-> wallet adg-08m receive-status wallet_89abcdef0123456789abcdef
-{"intent_id":"wallet_89abcdef0123456789abcdef","state":"PAID","quote_state":"PAID","amount":100,"request":"lnbc1000n...","expiry":1234567890,"invoice_sha256":"...","quote_sha256":"...","output_plan_sha256":"...","proofs_issued":0,"balance":null,"error_code":null}
+> wallet <key> receive-status wallet_89abcdef0123456789abcdef
+{"intent_id":"wallet_89abcdef0123456789abcdef","state":"PAID","quote_state":"PAID","amount":100,"proofs_issued":0,"balance":null,"error_code":null}
 
-> wallet adg-08m receive-execute wallet_89abcdef0123456789abcdef <invoice_sha256> <quote_sha256> <output_plan_sha256>
-{"intent_id":"wallet_89abcdef0123456789abcdef","state":"ISSUED","quote_state":"ISSUED","amount":100,"request":"lnbc1000n...","expiry":1234567890,"invoice_sha256":"...","quote_sha256":"...","output_plan_sha256":"...","proofs_issued":2,"balance":100,"error_code":null}
+> wallet <key> receive-execute wallet_89abcdef0123456789abcdef <invoice_sha256> <quote_sha256> <output_plan_sha256> <approval_signature>
+{"intent_id":"wallet_89abcdef0123456789abcdef","state":"ISSUED","quote_state":"ISSUED","amount":100,"proofs_issued":2,"balance":100,"error_code":null}
 
-> wallet adg-08m balance
-{"access_key":"adg-08m","name":"agent-session-1","mint":"https://mint.minibits.cash/Bitcoin","unit":"sat","balance":100,"pending_balance":0}
+> wallet <key> balance
+{"access_key":"<64-hex-access-key>","name":"agent-session-1","mint":"https://mint.minibits.cash/Bitcoin","unit":"sat","balance":100,"pending_balance":0}
 
-> wallet adg-08m pay-prepare wallet_0123456789abcdef01234567 lnbc500n...
-{"intent_id":"wallet_0123456789abcdef01234567","state":"PREPARED","amount":50,"fee_reserve":1,"input_fee":1,"max_spend":52,"expiry":1234567890,"payment_hash":"...","invoice_sha256":"...","quote_sha256":"...","proof_plan_sha256":"..."}
+> wallet <key> pay-prepare wallet_0123456789abcdef01234567 lnbc500n...
+{"intent_id":"wallet_0123456789abcdef01234567","state":"PREPARED","amount":50,"max_spend":52,"expiry":2000003600,"invoice_sha256":"...","quote_sha256":"...","proof_plan_sha256":"...","approval_payload":"{...}"}
 
-> wallet adg-08m pay-execute wallet_0123456789abcdef01234567 <invoice_sha256> <quote_sha256> <proof_plan_sha256>
+> wallet <key> pay-execute wallet_0123456789abcdef01234567 <invoice_sha256> <quote_sha256> <proof_plan_sha256> <approval_signature>
 {"intent_id":"wallet_0123456789abcdef01234567","state":"PAID","quote_state":"PAID","proof_states":["SPENT"],"payment_preimage":"...","error_code":null}
 ```
 
 The prepare response deliberately omits the raw quote ID, invoice, proofs, and change outputs.
-Those values stay in the private Ippon database. The three hashes must be bound to an external
-approval before `pay-execute` is called. The legacy one-shot `pay` and raw-ID `pay-check` commands
-return `UNSAFE_OPERATION`.
+Those values stay in the private Ippon database. The exact `approval_payload`
+must be reviewed and signed outside the wallet runtime before execute is
+called. See [`docs/APPROVAL_PROTOCOL.md`](docs/APPROVAL_PROTOCOL.md). The legacy
+one-shot CLI mutations return `UNSAFE_OPERATION`.
 
 ### Piping commands (non-interactive)
 
@@ -489,11 +511,9 @@ Each command can be piped as a single stdin line; the process exits cleanly afte
 KEY=$(echo "wallet create bot" | DATABASE_ENGINE=sqlite INTERACTION_MODE=cli LOG_LEVEL=error node dist/index.js 2>/dev/null \
   | node -e "process.stdin.setEncoding('utf8');let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).access_key))")
 
-# Receive a token
-echo "wallet $KEY receive cashuB..." | DATABASE_ENGINE=sqlite INTERACTION_MODE=cli LOG_LEVEL=error node dist/index.js 2>/dev/null
-
-# Payment is intentionally not a one-line pipe: call pay-prepare, bind its
-# hashes to an external approval, and only then call pay-execute once.
+# Value-changing operations are intentionally not a one-line pipe: prepare,
+# review and sign the returned approval_payload outside this runtime, then call
+# execute once. Use status rather than retrying after an uncertain result.
 ```
 
 ## Environment variables
@@ -504,19 +524,21 @@ echo "wallet $KEY receive cashuB..." | DATABASE_ENGINE=sqlite INTERACTION_MODE=c
 | `DATABASE_URL` | PostgreSQL connection string (required when `DATABASE_ENGINE=postgresql`) | — |
 | `DATABASE_FILE_PATH` | SQLite file path, supports `~` expansion (used when `DATABASE_ENGINE=sqlite`) | `~/.ippon/database.sqlite` |
 | `INTERACTION_MODE` | Runtime mode: `api` (HTTP server) or `cli` (stdio REPL) | `api` |
+| `IPPON_APPROVAL_PUBLIC_KEY` | Ed25519 public key used to verify CLI execute capabilities (base64url SPKI or PEM). Never configure the private key here. | — |
 | `PORT` | HTTP server port (API mode only) | `3001` |
 | `LOG_LEVEL` | Log verbosity (`trace`, `debug`, `info`, `warn`, `error`) | `debug` |
 | `MINT_URLS` | Comma-separated list of supported Cashu mint URLs. First entry is the default. | — |
 | `UNIT` | Wallet unit (`sat` or `msat`) | `sat` |
 | `MAX_BALANCE` | Global max wallet balance (in unit) | `100000` |
 | `MAX_SEND` | Global max ecash send amount | `50000` |
-| `MAX_PAY` | Global max Lightning payment amount | `50000` |
+| `MAX_PAY` | Global max prepared Lightning wallet spend, including mint fee reserve and selected-proof input fees | `50000` |
 | `SERVICE_STATUS` | Status string returned by `/v1/info` (API mode only) | `operational` |
 | `SERVICE_HELP` | Help URL returned by `/v1/info` (API mode only) | — |
 | `SERVICE_TERMS` | Terms URL returned by `/v1/info` (API mode only) | — |
 | `RATE_LIMIT_MAX` | Default max requests per window (API mode only) | `100` |
 | `RATE_LIMIT_CREATE_WALLET_MAX` | Max wallet creations per window per IP (API mode only) | `3` |
 | `RATE_LIMIT_WINDOW` | Rate-limit time window (API mode only) | `1 minute` |
+| `TRUST_PROXY` | `false` or a comma-separated trusted proxy IP/CIDR allowlist used for client-IP rate limiting | `false` |
 
 All configured values are printed to **stderr** at startup regardless of mode, making it easy to verify the active configuration.
 
@@ -592,13 +614,15 @@ following files without a live mint or funded wallet:
 | `src/__tests__/walletService.test.ts` | Unit — `WalletService` methods with Prisma and cashu-ts mocked |
 | `src/__tests__/splitMeltService.test.ts` | Unit — prepare/execute separation, restart recovery, reconciliation, and failure injection |
 | `src/__tests__/splitMintService.test.ts` | Unit — locked receive preparation, one mint attempt, and NUT-09 recovery |
+| `src/__tests__/approvalCapability.test.ts` | Unit — Ed25519 capability verification, tamper rejection, and fail-closed configuration |
 | `src/__tests__/publicRoutes.test.ts` | Integration — unauthenticated routes (`GET /v1/info`, `POST /v1/wallet`) |
 | `src/__tests__/protectedRoutes.test.ts` | Integration — all authenticated routes via Fastify `inject()` |
 | `scripts/private-sqlite-path.test.mjs` | Unit — private directory/file modes and symbolic-link rejection |
+| `scripts/approval-tool.test.mjs` | Unit — private key-file modes and detached signature interoperability |
 
 ```bash
 # Run once
-yarn test
+yarn run verify
 
 # Watch mode
 yarn test:watch

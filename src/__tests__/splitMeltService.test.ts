@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import crypto from 'crypto'
 import { Amount, CheckStateEnum, MeltQuoteState, OutputData } from '@cashu/cashu-ts'
 import { MeltOperationState, ProofStatus } from '@prisma/client'
 
@@ -7,6 +8,7 @@ const PAYMENT_PREIMAGE = '11'.repeat(32)
 const INVOICE = 'lnbc1testinvoice'
 const INTENT_ID = 'wallet_0123456789abcdef01234567'
 const NOW = 2_000_000_000
+const approvalKeys = crypto.generateKeyPairSync('ed25519')
 
 const mocks = vi.hoisted(() => ({
     getWallet: vi.fn(),
@@ -118,6 +120,20 @@ function approval(prepared: Awaited<ReturnType<typeof SplitMeltService.prepare>>
     }
 }
 
+function signature(prepared: Awaited<ReturnType<typeof SplitMeltService.prepare>>): string {
+    return crypto.sign(
+        null,
+        Buffer.from(prepared.approval_payload, 'utf8'),
+        approvalKeys.privateKey,
+    ).toString('base64url')
+}
+
+function executePrepared(
+    prepared: Awaited<ReturnType<typeof SplitMeltService.prepare>>,
+) {
+    return SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared), signature(prepared))
+}
+
 describe('SplitMeltService', () => {
     let operation: any
     let proofStatus: ProofStatus
@@ -141,6 +157,9 @@ describe('SplitMeltService', () => {
         proofStatus = ProofStatus.UNSPENT
         reservedByIntentId = null
         storedChange.clear()
+        process.env.IPPON_APPROVAL_PUBLIC_KEY = approvalKeys.publicKey
+            .export({ format: 'der', type: 'spki' })
+            .toString('base64url')
 
         mocks.getWallet.mockResolvedValue(wallet)
         mocks.loadProofs.mockResolvedValue([selectedProof])
@@ -186,6 +205,11 @@ describe('SplitMeltService', () => {
             return operation
         })
         mocks.meltOperationUpdateMany.mockImplementation(async ({ where, data }: any) => {
+            if (where.state?.notIn) {
+                if (!operation || where.state.notIn.includes(operation.state)) return { count: 0 }
+                operation = { ...operation, ...data, updatedAt: new Date() }
+                return { count: 1 }
+            }
             if (!operation
                 || operation.intentId !== where.intentId
                 || operation.state !== where.state
@@ -351,6 +375,17 @@ describe('SplitMeltService', () => {
         expect(operation).toBeNull()
     })
 
+    it('applies MAX_PAY to the quote amount plus its fee reserve', async () => {
+        await expect(SplitMeltService.prepare(
+            { ...storedWallet, maxPay: 106 },
+            INTENT_ID,
+            INVOICE,
+        )).rejects.toMatchObject({ code: 'PAYMENT_LIMIT_EXCEEDED' })
+
+        expect(mocks.prepareMelt).not.toHaveBeenCalled()
+        expect(operation).toBeNull()
+    })
+
     it('rejects a preview that changes the selected proof inputs', async () => {
         mocks.prepareMelt.mockResolvedValueOnce({
             method: 'bolt11',
@@ -394,7 +429,7 @@ describe('SplitMeltService', () => {
         const prepared = await SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE)
         proofStatus = ProofStatus.SPENT
 
-        await expect(SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared)))
+        await expect(executePrepared(prepared))
             .rejects.toMatchObject({ code: 'PROOF_RESERVATION_MISMATCH' })
 
         expect(operation.state).toBe(MeltOperationState.PREPARED)
@@ -404,7 +439,7 @@ describe('SplitMeltService', () => {
 
     it('reconstructs the persisted preview, executes once, and verifies the preimage', async () => {
         const prepared = await SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE)
-        const result = await SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared))
+        const result = await executePrepared(prepared)
 
         expect(result).toMatchObject({
             state: MeltOperationState.PAID,
@@ -425,9 +460,23 @@ describe('SplitMeltService', () => {
             quote: { quote: 'private-quote-id' },
         })
 
-        await expect(SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared)))
+        await expect(executePrepared(prepared))
             .rejects.toMatchObject({ code: 'OPERATION_ALREADY_EXECUTED' })
         expect(mocks.completeMelt).toHaveBeenCalledTimes(1)
+    })
+
+    it('keeps PAID terminal when a later status check would be unavailable', async () => {
+        const prepared = await SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE)
+        const paid = await executePrepared(prepared)
+        const checksBeforeStatus = mocks.checkMeltQuoteBolt11.mock.calls.length
+        mocks.checkMeltQuoteBolt11.mockRejectedValueOnce(new Error('mint unavailable'))
+
+        const status = await SplitMeltService.status(storedWallet, INTENT_ID)
+
+        expect(paid.state).toBe(MeltOperationState.PAID)
+        expect(status.state).toBe(MeltOperationState.PAID)
+        expect(operation.state).toBe(MeltOperationState.PAID)
+        expect(mocks.checkMeltQuoteBolt11).toHaveBeenCalledTimes(checksBeforeStatus + 1)
     })
 
     it('never retries an ambiguous melt and reconciles it after restart', async () => {
@@ -435,7 +484,7 @@ describe('SplitMeltService', () => {
         mocks.completeMelt.mockRejectedValueOnce(new Error('connection lost'))
         mocks.checkMeltQuoteBolt11.mockRejectedValueOnce(new Error('mint unavailable'))
 
-        const unknown = await SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared))
+        const unknown = await executePrepared(prepared)
         expect(unknown).toMatchObject({
             state: MeltOperationState.UNKNOWN,
             error_code: 'reconciliation_unavailable',
@@ -454,7 +503,7 @@ describe('SplitMeltService', () => {
         const prepared = await SplitMeltService.prepare(storedWallet, INTENT_ID, INVOICE)
         vi.spyOn(Date, 'now').mockReturnValue((NOW + 3_601) * 1000)
 
-        const result = await SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared))
+        const result = await executePrepared(prepared)
 
         expect(result).toMatchObject({
             state: MeltOperationState.EXPIRED,
@@ -484,7 +533,7 @@ describe('SplitMeltService', () => {
         await expect(SplitMeltService.execute(storedWallet, INTENT_ID, {
             ...approval(prepared),
             quoteSha256: '00'.repeat(32),
-        })).rejects.toMatchObject({ code: 'APPROVAL_MISMATCH' })
+        }, signature(prepared))).rejects.toMatchObject({ code: 'APPROVAL_MISMATCH' })
 
         expect(operation.executionCount).toBe(0)
         expect(mocks.completeMelt).not.toHaveBeenCalled()
@@ -498,7 +547,7 @@ describe('SplitMeltService', () => {
             outputData: [],
         })
 
-        const result = await SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared))
+        const result = await executePrepared(prepared)
         expect(result).toMatchObject({
             state: MeltOperationState.UNKNOWN,
             error_code: 'preimage_mismatch',
@@ -516,7 +565,7 @@ describe('SplitMeltService', () => {
         })
         mocks.checkProofsStates.mockResolvedValueOnce([{ state: CheckStateEnum.UNSPENT }])
 
-        const result = await SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared))
+        const result = await executePrepared(prepared)
         expect(result).toMatchObject({ state: MeltOperationState.UNPAID })
         expect(proofStatus).toBe(ProofStatus.UNSPENT)
         expect(reservedByIntentId).toBeNull()
@@ -535,7 +584,7 @@ describe('SplitMeltService', () => {
             change: [changeProof],
             outputData: [],
         })
-        const paid = await SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared))
+        const paid = await executePrepared(prepared)
         expect(paid).toMatchObject({
             fee_paid: 4,
             total_spent: 104,
@@ -574,7 +623,7 @@ describe('SplitMeltService', () => {
             outputData: [],
         })
 
-        const result = await SplitMeltService.execute(storedWallet, INTENT_ID, approval(prepared))
+        const result = await executePrepared(prepared)
 
         expect(result).toMatchObject({
             state: MeltOperationState.UNKNOWN,
