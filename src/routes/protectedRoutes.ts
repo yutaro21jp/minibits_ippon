@@ -12,6 +12,7 @@ import { log } from '../services/logService'
 import { WalletService } from '../services/walletService'
 import { getExchangeRate, isSupportedCurrency } from '../services/exchangeRateService'
 import AppError, { Err } from '../utils/AppError'
+import prisma from '../utils/prismaClient'
 import {
     WalletResponse,
     WalletDepositRequest,
@@ -30,6 +31,9 @@ import {
     WalletReceiveResponse,
     RateRequest,
     RateResponse,
+    TransactionHistoryItem,
+    TransactionHistoryRequest,
+    TransactionHistoryResponse,
 } from './routeTypes'
 
 
@@ -130,6 +134,153 @@ export const protectedRoutes: FastifyPluginCallback = (instance, opts, done) => 
                 max_send:    wallet.maxSend,
                 max_pay:     wallet.maxPay,
             } : null,
+        }
+    })
+
+
+    // GET /v1/wallet/transactions
+    instance.get('/wallet/transactions', {
+        schema: {
+            description: 'List the authenticated wallet\'s approval-gated Lightning operation history. This read-only projection never exposes invoices, mint quote IDs, proofs, preimages, signatures, access keys, or recovery material.',
+            tags: ['Wallet'],
+            security: BEARER,
+            querystring: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                    limit:  { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+                    offset: { type: 'integer', minimum: 0, maximum: 1000, default: 0 },
+                },
+            },
+            response: {
+                200: {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['transactions', 'limit', 'offset', 'has_more'],
+                    properties: {
+                        transactions: {
+                            type: 'array',
+                            items: {
+                                type: 'object',
+                                additionalProperties: false,
+                                required: [
+                                    'intent_id', 'type', 'direction', 'amount', 'max_spend',
+                                    'unit', 'state', 'created_at', 'updated_at', 'executed_at',
+                                    'reconciled_at', 'error_code',
+                                ],
+                                properties: {
+                                    intent_id:     { type: 'string' },
+                                    type:          { type: 'string', enum: ['LIGHTNING_PAYMENT', 'LIGHTNING_RECEIVE'] },
+                                    direction:     { type: 'string', enum: ['OUTGOING', 'INCOMING'] },
+                                    amount:        { type: 'integer' },
+                                    max_spend:     { type: 'integer', nullable: true },
+                                    unit:          { type: 'string' },
+                                    state:         { type: 'string' },
+                                    created_at:    { type: 'string', format: 'date-time' },
+                                    updated_at:    { type: 'string', format: 'date-time' },
+                                    executed_at:   { type: 'string', format: 'date-time', nullable: true },
+                                    reconciled_at: { type: 'string', format: 'date-time', nullable: true },
+                                    error_code:    { type: 'string', nullable: true },
+                                },
+                            },
+                        },
+                        limit:    { type: 'integer' },
+                        offset:   { type: 'integer' },
+                        has_more: { type: 'boolean' },
+                    },
+                },
+            },
+        },
+    }, async (req: TransactionHistoryRequest, res: FastifyReply): Promise<TransactionHistoryResponse> => {
+        const wallet = getAuthWallet(req)
+        const limit = req.query.limit ?? 50
+        const offset = req.query.offset ?? 0
+        const take = offset + limit + 1
+
+        const [meltOperations, mintOperations] = await Promise.all([
+            prisma.meltOperation.findMany({
+                where: { walletId: wallet.id },
+                select: {
+                    intentId: true,
+                    amount: true,
+                    maxSpend: true,
+                    state: true,
+                    errorCode: true,
+                    createdAt: true,
+                    updatedAt: true,
+                    executedAt: true,
+                    reconciledAt: true,
+                },
+                orderBy: [{ createdAt: 'desc' }, { intentId: 'asc' }],
+                take,
+            }),
+            prisma.mintOperation.findMany({
+                where: { walletId: wallet.id },
+                select: {
+                    intentId: true,
+                    amount: true,
+                    state: true,
+                    errorCode: true,
+                    createdAt: true,
+                    updatedAt: true,
+                    executedAt: true,
+                    reconciledAt: true,
+                },
+                orderBy: [{ createdAt: 'desc' }, { intentId: 'asc' }],
+                take,
+            }),
+        ])
+
+        const transactions: TransactionHistoryItem[] = [
+            ...meltOperations.map(operation => ({
+                intent_id: operation.intentId,
+                type: 'LIGHTNING_PAYMENT' as const,
+                direction: 'OUTGOING' as const,
+                amount: operation.amount,
+                max_spend: operation.maxSpend,
+                unit: wallet.unit,
+                state: operation.state,
+                created_at: operation.createdAt.toISOString(),
+                updated_at: operation.updatedAt.toISOString(),
+                executed_at: operation.executedAt?.toISOString() ?? null,
+                reconciled_at: operation.reconciledAt?.toISOString() ?? null,
+                error_code: operation.errorCode,
+            })),
+            ...mintOperations.map(operation => ({
+                intent_id: operation.intentId,
+                type: 'LIGHTNING_RECEIVE' as const,
+                direction: 'INCOMING' as const,
+                amount: operation.amount,
+                max_spend: null,
+                unit: wallet.unit,
+                state: operation.state,
+                created_at: operation.createdAt.toISOString(),
+                updated_at: operation.updatedAt.toISOString(),
+                executed_at: operation.executedAt?.toISOString() ?? null,
+                reconciled_at: operation.reconciledAt?.toISOString() ?? null,
+                error_code: operation.errorCode,
+            })),
+        ].sort((a, b) => {
+            const byCreatedAt = b.created_at.localeCompare(a.created_at)
+            if (byCreatedAt !== 0) return byCreatedAt
+            const byType = a.type.localeCompare(b.type)
+            if (byType !== 0) return byType
+            return a.intent_id.localeCompare(b.intent_id)
+        })
+
+        log.info('GET /v1/wallet/transactions', {
+            walletId: wallet.id,
+            limit,
+            offset,
+            returned: Math.min(limit, Math.max(0, transactions.length - offset)),
+            reqId: req.id,
+        })
+
+        return {
+            transactions: transactions.slice(offset, offset + limit),
+            limit,
+            offset,
+            has_more: transactions.length > offset + limit,
         }
     })
 

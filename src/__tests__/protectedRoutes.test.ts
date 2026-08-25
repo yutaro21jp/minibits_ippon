@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
     prismaWalletFindUnique: vi.fn(),
     prismaWalletCreate: vi.fn(),
     prismaWalletDelete: vi.fn(),
+    prismaMeltOperationFindMany: vi.fn(),
+    prismaMintOperationFindMany: vi.fn(),
     getWalletBalance: vi.fn(),
     createMintQuote: vi.fn(),
     checkMintQuote: vi.fn(),
@@ -45,6 +47,12 @@ vi.mock('../utils/prismaClient', () => ({
             create: vi.fn(),
             updateMany: vi.fn(),
             deleteMany: vi.fn(),
+        },
+        meltOperation: {
+            findMany: mocks.prismaMeltOperationFindMany,
+        },
+        mintOperation: {
+            findMany: mocks.prismaMintOperationFindMany,
         },
     },
 }))
@@ -172,6 +180,147 @@ describe('GET /v1/wallet', () => {
         expect(body.pending_balance).toBe(0)
         expect(body.unit).toBe('sat')
         expect(body.access_key).toBe(WALLET.accessKey)
+    })
+})
+
+describe('GET /v1/wallet/transactions', () => {
+    let app: FastifyInstance
+
+    beforeEach(async () => {
+        vi.clearAllMocks()
+        mocks.prismaWalletFindUnique.mockResolvedValue(WALLET)
+        mocks.prismaMeltOperationFindMany.mockResolvedValue([])
+        mocks.prismaMintOperationFindMany.mockResolvedValue([])
+        app = await buildApp()
+        await app.ready()
+    })
+
+    it('returns a wallet-scoped, newest-first projection without payment secrets', async () => {
+        mocks.prismaMeltOperationFindMany.mockResolvedValue([{
+            intentId: 'wallet_pay_1',
+            amount: 50,
+            maxSpend: 52,
+            state: 'PAID',
+            errorCode: null,
+            createdAt: new Date('2026-08-24T10:00:00.000Z'),
+            updatedAt: new Date('2026-08-24T10:01:00.000Z'),
+            executedAt: new Date('2026-08-24T10:00:30.000Z'),
+            reconciledAt: null,
+            quoteId: 'must-not-leak',
+            request: 'lnbc-must-not-leak',
+            selectedProofsJson: 'must-not-leak',
+        }])
+        mocks.prismaMintOperationFindMany.mockResolvedValue([{
+            intentId: 'wallet_receive_1',
+            amount: 100,
+            state: 'ISSUED',
+            errorCode: null,
+            createdAt: new Date('2026-08-24T11:00:00.000Z'),
+            updatedAt: new Date('2026-08-24T11:01:00.000Z'),
+            executedAt: new Date('2026-08-24T11:00:30.000Z'),
+            reconciledAt: new Date('2026-08-24T11:01:00.000Z'),
+            quoteId: 'must-not-leak',
+            request: 'lnbc-must-not-leak',
+            quotePrivkey: 'must-not-leak',
+            signature: 'must-not-leak',
+        }])
+
+        const res = await get(app, '/v1/wallet/transactions?limit=2&offset=0')
+
+        expect(res.statusCode).toBe(200)
+        expect(mocks.prismaMeltOperationFindMany).toHaveBeenCalledWith(expect.objectContaining({
+            where: { walletId: WALLET.id },
+            take: 3,
+        }))
+        expect(mocks.prismaMintOperationFindMany).toHaveBeenCalledWith(expect.objectContaining({
+            where: { walletId: WALLET.id },
+            take: 3,
+        }))
+
+        const body = res.json()
+        expect(body).toEqual({
+            transactions: [
+                {
+                    intent_id: 'wallet_receive_1',
+                    type: 'LIGHTNING_RECEIVE',
+                    direction: 'INCOMING',
+                    amount: 100,
+                    max_spend: null,
+                    unit: 'sat',
+                    state: 'ISSUED',
+                    created_at: '2026-08-24T11:00:00.000Z',
+                    updated_at: '2026-08-24T11:01:00.000Z',
+                    executed_at: '2026-08-24T11:00:30.000Z',
+                    reconciled_at: '2026-08-24T11:01:00.000Z',
+                    error_code: null,
+                },
+                {
+                    intent_id: 'wallet_pay_1',
+                    type: 'LIGHTNING_PAYMENT',
+                    direction: 'OUTGOING',
+                    amount: 50,
+                    max_spend: 52,
+                    unit: 'sat',
+                    state: 'PAID',
+                    created_at: '2026-08-24T10:00:00.000Z',
+                    updated_at: '2026-08-24T10:01:00.000Z',
+                    executed_at: '2026-08-24T10:00:30.000Z',
+                    reconciled_at: null,
+                    error_code: null,
+                },
+            ],
+            limit: 2,
+            offset: 0,
+            has_more: false,
+        })
+        expect(JSON.stringify(body)).not.toMatch(/quoteId|request|proof|privkey|signature|preimage|access_key|must-not-leak/i)
+    })
+
+    it('paginates the merged operation history with bounded queries', async () => {
+        const operation = (intentId: string, hour: number) => ({
+            intentId,
+            amount: 1,
+            maxSpend: 1,
+            state: 'PREPARED',
+            errorCode: null,
+            createdAt: new Date(`2026-08-24T${hour.toString().padStart(2, '0')}:00:00.000Z`),
+            updatedAt: new Date(`2026-08-24T${hour.toString().padStart(2, '0')}:00:00.000Z`),
+            executedAt: null,
+            reconciledAt: null,
+        })
+        mocks.prismaMeltOperationFindMany.mockResolvedValue([
+            operation('wallet_pay_3', 12),
+            operation('wallet_pay_1', 10),
+        ])
+        mocks.prismaMintOperationFindMany.mockResolvedValue([{
+            ...operation('wallet_receive_2', 11),
+        }])
+
+        const res = await get(app, '/v1/wallet/transactions?limit=1&offset=1')
+
+        expect(res.statusCode).toBe(200)
+        const body = res.json()
+        expect(body.transactions).toHaveLength(1)
+        expect(body.transactions[0].intent_id).toBe('wallet_receive_2')
+        expect(body.has_more).toBe(true)
+        expect(mocks.prismaMeltOperationFindMany).toHaveBeenCalledWith(expect.objectContaining({ take: 3 }))
+        expect(mocks.prismaMintOperationFindMany).toHaveBeenCalledWith(expect.objectContaining({ take: 3 }))
+    })
+
+    it('rejects unbounded pagination before querying operation history', async () => {
+        const res = await get(app, '/v1/wallet/transactions?limit=101&offset=0')
+
+        expect(res.statusCode).toBe(400)
+        expect(mocks.prismaMeltOperationFindMany).not.toHaveBeenCalled()
+        expect(mocks.prismaMintOperationFindMany).not.toHaveBeenCalled()
+    })
+
+    it('requires the wallet bearer credential', async () => {
+        const res = await get(app, '/v1/wallet/transactions', {})
+
+        expect(res.statusCode).toBe(401)
+        expect(mocks.prismaMeltOperationFindMany).not.toHaveBeenCalled()
+        expect(mocks.prismaMintOperationFindMany).not.toHaveBeenCalled()
     })
 })
 

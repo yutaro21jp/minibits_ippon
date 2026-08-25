@@ -255,6 +255,28 @@ curl -X GET http://localhost:3001/v1/wallet \
   -H "Authorization: Bearer abc123_access_key"
 ```
 
+### GET /v1/wallet/transactions
+
+Returns a newest-first, read-only history of the authenticated wallet's signed
+Lightning payment and receive operations. The history is derived from the
+durable melt and mint operation records rather than a second mutable source of
+truth. It never returns invoices, mint quote IDs, proofs, preimages, signatures,
+access keys, or recovery material.
+
+Use `limit` (1–100, default 50) and `offset` (0–1000, default 0) for bounded
+pagination. Prepared and unresolved operations are included so callers can
+distinguish proposals and ambiguous outcomes from completed transfers.
+
+| Authorization     | Request Type              | Response Type              |
+|-------------------|---------------------------|----------------------------|
+| Bearer access_key | TransactionHistoryRequest | TransactionHistoryResponse |
+
+**Example:**
+```bash
+curl -X GET 'http://localhost:3001/v1/wallet/transactions?limit=25&offset=0' \
+  -H "Authorization: Bearer abc123_access_key"
+```
+
 ### POST /v1/wallet/deposit
 
 Requests a Lightning invoice for funding the wallet with a specified amount. The wallet automatically handles the mint quote and ecash issuance once the invoice is paid.
@@ -616,7 +638,7 @@ following files without a live mint or funded wallet:
 | `src/__tests__/splitMintService.test.ts` | Unit — locked receive preparation, one mint attempt, and NUT-09 recovery |
 | `src/__tests__/approvalCapability.test.ts` | Unit — Ed25519 capability verification, tamper rejection, and fail-closed configuration |
 | `src/__tests__/publicRoutes.test.ts` | Integration — unauthenticated routes (`GET /v1/info`, `POST /v1/wallet`) |
-| `src/__tests__/protectedRoutes.test.ts` | Integration — all authenticated routes via Fastify `inject()` |
+| `src/__tests__/protectedRoutes.test.ts` | Integration — authenticated routes, wallet-scoped transaction history, bounded pagination, and secret-free responses via Fastify `inject()` |
 | `scripts/private-sqlite-path.test.mjs` | Unit — private directory/file modes and symbolic-link rejection |
 | `scripts/approval-tool.test.mjs` | Unit — private key-file modes and detached signature interoperability |
 
@@ -637,8 +659,14 @@ test and uses only loopback FakeWallet mints.
 
 The companion [minibits_ippon_mcp](https://github.com/minibits-cash/minibits_ippon_mcp) project provides an MCP server that wraps the wallet API for AI agent integration. It manages session lifecycle and safeguards the wallet access key so that agents never handle it directly.
 
-## TO-DO's
+## Roadmap
 
-- [x] lock token to pubkey
-- [ ] pay cashu payment request
-- [ ] add transactions model and API
+- [x] NUT-11 P2PK output support in the wallet service. Public one-step ecash
+  send surfaces remain disabled until they have signed approval and durable
+  recovery models.
+- [x] Read-only, wallet-scoped transaction history API derived from the durable
+  Lightning melt and mint operation records.
+- [ ] Approval-gated Cashu Payment Request execution. Decoding is supported,
+  but payment remains disabled until ecash export has amount, destination,
+  mint, expiry, replay, execution-count, and ambiguous-result recovery
+  bindings equivalent to the Lightning split flow.

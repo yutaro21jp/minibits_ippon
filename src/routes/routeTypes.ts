@@ -60,6 +60,37 @@ export interface WalletResponse {
     limits:          WalletLimits | null
 }
 
+// ── GET /v1/wallet/transactions ─────────────────────────────────────────────
+
+export type TransactionHistoryRequest = FastifyRequest<{
+    Querystring: {
+        limit?:  number
+        offset?: number
+    }
+}>
+
+export interface TransactionHistoryItem {
+    intent_id:     string
+    type:          'LIGHTNING_PAYMENT' | 'LIGHTNING_RECEIVE'
+    direction:     'OUTGOING' | 'INCOMING'
+    amount:        number
+    max_spend:     number | null
+    unit:          string
+    state:         string
+    created_at:    string
+    updated_at:    string
+    executed_at:   string | null
+    reconciled_at: string | null
+    error_code:    string | null
+}
+
+export interface TransactionHistoryResponse {
+    transactions: TransactionHistoryItem[]
+    limit:        number
+    offset:       number
+    has_more:     boolean
+}
+
 // ── POST /v1/wallet/deposit ──────────────────────────────────────────────────
 
 export type WalletDepositRequest = FastifyRequest<{
