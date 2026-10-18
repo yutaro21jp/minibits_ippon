@@ -49,24 +49,26 @@ vi.mock('@cashu/cashu-ts', async (importOriginal) => {
         setGlobalRequestOptions: mocks.setGlobalRequestOptions,
         getDecodedToken: mocks.getDecodedToken,
         getTokenMetadata: mocks.getTokenMetadata,
-        Wallet: vi.fn().mockImplementation(() => ({
-            loadMint: mocks.walletLoadMint,
-            send: mocks.walletSend,
-            receive: mocks.walletReceive,
-            checkProofsStates: mocks.walletCheckProofsStates,
-            createMintQuoteBolt11: mocks.walletCreateMintQuoteBolt11,
-            checkMintQuoteBolt11: mocks.walletCheckMintQuoteBolt11,
-            mintProofsBolt11: mocks.walletMintProofsBolt11,
-            createMeltQuoteBolt11: mocks.walletCreateMeltQuoteBolt11,
-            checkMeltQuoteBolt11: mocks.walletCheckMeltQuoteBolt11,
-            meltProofsBolt11: mocks.walletMeltProofsBolt11,
-            getKeyset: mocks.getKeyset,
-            bindKeyset: mocks.walletBindKeyset,
-            keyChain: {
-                getAllKeysetIds: mocks.getAllKeysetIds,
-                getCheapestKeyset: mocks.getCheapestKeyset,
-            },
-        })),
+        Wallet: vi.fn().mockImplementation(function () {
+            return {
+                loadMint: mocks.walletLoadMint,
+                send: mocks.walletSend,
+                receive: mocks.walletReceive,
+                checkProofsStates: mocks.walletCheckProofsStates,
+                createMintQuoteBolt11: mocks.walletCreateMintQuoteBolt11,
+                checkMintQuoteBolt11: mocks.walletCheckMintQuoteBolt11,
+                mintProofsBolt11: mocks.walletMintProofsBolt11,
+                createMeltQuoteBolt11: mocks.walletCreateMeltQuoteBolt11,
+                checkMeltQuoteBolt11: mocks.walletCheckMeltQuoteBolt11,
+                meltProofsBolt11: mocks.walletMeltProofsBolt11,
+                getKeyset: mocks.getKeyset,
+                bindKeyset: mocks.walletBindKeyset,
+                keyChain: {
+                    getAllKeysetIds: mocks.getAllKeysetIds,
+                    getCheapestKeyset: mocks.getCheapestKeyset,
+                },
+            }
+        }),
     }
 })
 
